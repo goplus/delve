@@ -1059,6 +1059,7 @@ func (state *golistState) invokeGo(verb string, args ...string) (*bytes.Buffer, 
 		// Workaround for an instance of golang.org/issue/26755: go list -e  will return a non-zero exit
 		// status if there's a dependency on a package that doesn't exist. But it should return
 		// a zero exit status and set an error on that package.
+		// gopdlv: comment temporarily for Go+
 		/* if len(stderr.String()) > 0 && strings.Contains(stderr.String(), "no Go files in") {
 			// Don't clobber stdout if `go list` actually returned something.
 			if len(stdout.String()) > 0 {
