@@ -706,6 +706,13 @@ func (bi *BinaryInfo) LoadBinaryInfo(path string, entryPoint uint64, debugInfoDi
 	return bi.AddImage(path, entryPoint)
 }
 
+func PackagePathMap(path string) map[string]string {
+	// TODO: getBinary Build Info: mod info
+	//
+	// buildinfo.ReadFile()
+	return nil
+}
+
 func loadBinaryInfo(bi *BinaryInfo, image *Image, path string, entryPoint uint64) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
