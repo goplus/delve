@@ -3220,6 +3220,12 @@ func TestDebugStripped2(t *testing.T) {
 	})
 }
 
+func TestGopInfo(t *testing.T) {
+	withTestProcess("goptest/", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+		p.BinInfo()
+	})
+}
+
 func TestIssue844(t *testing.T) {
 	// Conditional breakpoints should not prevent next from working if their
 	// condition isn't met.
