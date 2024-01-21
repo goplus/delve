@@ -720,7 +720,17 @@ func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 	if len(bi.buildModInfoMap) == 0 {
 		bi.buildModInfoMap = make(map[string]string)
 		binfo, _ := buildinfo.ReadFile(path)
-		bi.buildModInfoMap["main"] = filepath.ToSlash(filepath.Dir(path)) + "/"
+		fileSplit := strings.Split((filepath.ToSlash(filepath.Dir(path)) + "/"), "/")
+		for i := len(fileSplit) - 1; i > 0; i-- {
+			currentDir := strings.Join(fileSplit[:i], "/") + "/"
+			_, err := os.Open(currentDir + "go.mod")
+			if err == nil {
+				bi.buildModInfoMap["main"] = currentDir
+				bi.buildModInfoMap[binfo.Path] = currentDir
+				break
+			}
+		}
+
 		for _, m := range binfo.Deps {
 			aa := module.Version{
 				Path:    m.Path,
