@@ -820,7 +820,6 @@ type ErrCouldNotFindLine struct {
 
 func (err *ErrCouldNotFindLine) Error() string {
 	if err.fileFound {
-		panic("aaaa")
 		return fmt.Sprintf("could not find statement at %s:%d, please use a line with a statement", err.filename, err.lineno)
 	}
 	return fmt.Sprintf("could not find file %s", err.filename)
@@ -2339,9 +2338,6 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 	}
 	sort.Strings(bi.Sources)
 	bi.Sources = uniq(bi.Sources)
-	for i, v := range bi.Sources {
-		fmt.Println(i, v)
-	}
 	if cont != nil {
 		cont()
 	}
