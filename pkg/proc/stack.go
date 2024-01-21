@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"go/constant"
+	"path/filepath"
 	"reflect"
 	"strings"
 
@@ -323,7 +324,21 @@ func (it *stackIterator) newStackframe(ret, retaddr uint64) Stackframe {
 		l = -1
 	} else {
 		it.regs.FrameBase = it.frameBase(fn)
+		if filepath.Ext(f) != ".go" && !filepath.IsAbs(f) {
+
+			absFile := f
+			for _, fe2 := range fn.cu.lineInfo.FileNames {
+				absFile = filepath.ToSlash(fn.cu.name + strings.TrimPrefix(fe2.Path, fn.cu.lineInfo.IncludeDirs[fe2.DirIdx]))
+				for _, v := range it.bi.Sources {
+					if strings.HasSuffix(v, absFile) {
+						f = v
+					}
+				}
+			}
+
+		}
 	}
+
 	r := Stackframe{Current: Location{PC: it.pc, File: f, Line: l, Fn: fn}, Regs: it.regs, Ret: ret, stackHi: it.stackhi, SystemStack: it.systemstack, lastpc: it.pc}
 	if r.Regs.Reg(it.regs.PCRegNum) == nil {
 		r.Regs.AddReg(it.regs.PCRegNum, op.DwarfRegisterFromUint64(it.pc))

@@ -2,6 +2,7 @@ package proc
 
 import (
 	"bytes"
+	"debug/buildinfo"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -16,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,12 +31,14 @@ import (
 	"github.com/go-delve/delve/pkg/dwarf/loclist"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
+	"github.com/go-delve/delve/pkg/goplus/mod/modcache"
 	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/internal/gosym"
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc/debuginfod"
 	"github.com/go-delve/gore"
 	"github.com/hashicorp/golang-lru/simplelru"
+	"golang.org/x/mod/module"
 )
 
 const (
@@ -112,6 +116,8 @@ type BinaryInfo struct {
 	regabi bool
 
 	logger logflags.Logger
+
+	buildModInfoMap map[string]string
 }
 
 var (
@@ -702,15 +708,32 @@ func (bi *BinaryInfo) LoadBinaryInfo(path string, entryPoint uint64, debugInfoDi
 	}
 
 	bi.DebugInfoDirectories = debugInfoDirs
+	bi.PackagePathMap(path)
 
 	return bi.AddImage(path, entryPoint)
 }
 
-func PackagePathMap(path string) map[string]string {
+func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 	// TODO: getBinary Build Info: mod info
 	//
 	// buildinfo.ReadFile()
-	return nil
+	if len(bi.buildModInfoMap) == 0 {
+		bi.buildModInfoMap = make(map[string]string)
+		binfo, _ := buildinfo.ReadFile(path)
+		bi.buildModInfoMap["main"] = filepath.ToSlash(filepath.Dir(path)) + "/"
+		for _, m := range binfo.Deps {
+			aa := module.Version{
+				Path:    m.Path,
+				Version: m.Version,
+			}
+			cupath, _ := modcache.Path(aa)
+			if runtime.GOOS == "windows" {
+				cupath = filepath.ToSlash(cupath)
+			}
+			bi.buildModInfoMap[m.Path+"/"] = cupath + "/"
+		}
+	}
+	return bi.buildModInfoMap
 }
 
 func loadBinaryInfo(bi *BinaryInfo, image *Image, path string, entryPoint uint64) error {
@@ -797,6 +820,7 @@ type ErrCouldNotFindLine struct {
 
 func (err *ErrCouldNotFindLine) Error() string {
 	if err.fileFound {
+		panic("aaaa")
 		return fmt.Sprintf("could not find statement at %s:%d, please use a line with a statement", err.filename, err.lineno)
 	}
 	return fmt.Sprintf("could not find file %s", err.filename)
@@ -2295,17 +2319,29 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 
 	bi.lookupFunc = nil
 	bi.lookupGenericFunc = nil
-
 	for _, cu := range image.compileUnits {
 		if cu.lineInfo != nil {
+			cuName := cu.name
+			if runtime.GOOS == "windows" {
+				cuName = filepath.ToSlash(cuName)
+			}
 			for _, fileEntry := range cu.lineInfo.FileNames {
+				if filepath.Ext(fileEntry.Path) != ".go" && !filepath.IsAbs(fileEntry.Path) {
+					filePakage := strings.TrimSuffix(cuName, cu.lineInfo.IncludeDirs[fileEntry.DirIdx])
+					absPath := bi.buildModInfoMap[filePakage] + fileEntry.Path
+					cu.lineInfo.Lookup[absPath] = fileEntry
+					delete(cu.lineInfo.Lookup, fileEntry.Path)
+					fileEntry.Path = absPath
+				}
 				bi.Sources = append(bi.Sources, fileEntry.Path)
 			}
 		}
 	}
 	sort.Strings(bi.Sources)
 	bi.Sources = uniq(bi.Sources)
-
+	for i, v := range bi.Sources {
+		fmt.Println(i, v)
+	}
 	if cont != nil {
 		cont()
 	}
