@@ -1378,38 +1378,6 @@ func (s *Session) isNoDebug() bool {
 	return s.noDebugProcess != nil
 }
 
-func handlerGopFilePath(filePath string, sources []string) string {
-	if strings.Contains(filePath, ".gop") {
-		if runtime.GOOS == "windows" {
-			// Accept fileName which is case-insensitive and slash-insensitive match
-			filePath = strings.ToLower(filepath.ToSlash(filePath))
-		}
-		lastI := strings.LastIndex(filePath, "/")
-		if lastI == -1 {
-			return filePath
-		}
-		fileName := filePath[lastI+1:]
-		isGopSources := []string{}
-		for _, v := range sources {
-			if strings.LastIndex(v, fileName) != -1 {
-				if runtime.GOOS == "windows" {
-					v = filepath.ToSlash(strings.ToLower(v))
-				}
-				isGopSources = append(isGopSources, v)
-			}
-		}
-		sort.Slice(isGopSources, func(i, j int) bool {
-			return strings.Count(isGopSources[i], "/") > strings.Count(isGopSources[j], "/")
-		})
-		for _, v := range isGopSources {
-			if strings.Contains(filePath, v) {
-				return v
-			}
-		}
-	}
-	return filePath
-}
-
 func (s *Session) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 	if request.Arguments.Source.Path == "" {
 		s.sendErrorResponse(request.Request, UnableToSetBreakpoints, "Unable to set or clear breakpoints", "empty file path")
@@ -3920,13 +3888,13 @@ func (s *Session) toClientPath(path string) string {
 
 func (s *Session) toServerPath(path string) string {
 	if len(s.args.substitutePathClientToServer) == 0 {
-		return handlerGopFilePath(path, s.debugger.Target().BinInfo().Sources)
+		return path
 	}
 	serverPath := locspec.SubstitutePath(path, s.args.substitutePathClientToServer)
 	if serverPath != path {
 		s.config.log.Debugf("client path=%s converted to server path=%s\n", path, serverPath)
 	}
-	return handlerGopFilePath(serverPath, s.debugger.Target().BinInfo().Sources)
+	return serverPath
 }
 
 type logMessage struct {
