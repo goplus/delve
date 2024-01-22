@@ -721,26 +721,35 @@ func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 		bi.buildModInfoMap = make(map[string]string)
 		binfo, _ := buildinfo.ReadFile(path)
 		fileSplit := strings.Split((filepath.ToSlash(filepath.Dir(path)) + "/"), "/")
+		// not find abspath, use moduleName
+		currentDir := binfo.Path + "/"
 		for i := len(fileSplit) - 1; i > 0; i-- {
-			currentDir := strings.Join(fileSplit[:i], "/") + "/"
-			_, err := os.Open(currentDir + "go.mod")
+			temp := strings.Join(fileSplit[:i], "/") + "/"
+			_, err := os.Open(temp + "go.mod")
 			if err == nil {
-				bi.buildModInfoMap["main"] = currentDir
-				bi.buildModInfoMap[binfo.Path+"/"] = currentDir
+				currentDir = temp
 				break
 			}
 		}
+		bi.buildModInfoMap["main"] = currentDir
+		bi.buildModInfoMap[binfo.Path+"/"] = currentDir
 
 		for _, m := range binfo.Deps {
+			curModuleName := m.Path + "/"
 			aa := module.Version{
 				Path:    m.Path,
 				Version: m.Version,
 			}
-			cupath, _ := modcache.Path(aa)
+			cupath, err := modcache.Path(aa)
+			if err != nil {
+				// not find? use moduleName(unique)
+				bi.buildModInfoMap[curModuleName] = curModuleName
+				continue
+			}
 			if runtime.GOOS == "windows" {
 				cupath = filepath.ToSlash(cupath)
 			}
-			bi.buildModInfoMap[m.Path+"/"] = cupath + "/"
+			bi.buildModInfoMap[curModuleName] = cupath + "/"
 		}
 	}
 	return bi.buildModInfoMap
@@ -2336,7 +2345,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 			}
 			for _, fileEntry := range cu.lineInfo.FileNames {
 				fileExt := filepath.Ext(fileEntry.Path)
-				if fileExt != "" && fileExt != "go" && !filepath.IsAbs(fileEntry.Path) {
+				if fileExt != "" && fileExt != ".go" && fileExt != ".s" && !filepath.IsAbs(fileEntry.Path) {
 					filePakage := strings.TrimSuffix(cuName, cu.lineInfo.IncludeDirs[fileEntry.DirIdx])
 					absPath := bi.buildModInfoMap[filePakage] + fileEntry.Path
 					cu.lineInfo.Lookup[absPath] = fileEntry
