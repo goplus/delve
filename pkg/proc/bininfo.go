@@ -726,7 +726,7 @@ func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 			_, err := os.Open(currentDir + "go.mod")
 			if err == nil {
 				bi.buildModInfoMap["main"] = currentDir
-				bi.buildModInfoMap[binfo.Path] = currentDir
+				bi.buildModInfoMap[binfo.Path+"/"] = currentDir
 				break
 			}
 		}
@@ -2335,7 +2335,8 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 				cuName = filepath.ToSlash(cuName)
 			}
 			for _, fileEntry := range cu.lineInfo.FileNames {
-				if filepath.Ext(fileEntry.Path) != ".go" && !filepath.IsAbs(fileEntry.Path) {
+				fileExt := filepath.Ext(fileEntry.Path)
+				if fileExt != "" && fileExt != "go" && !filepath.IsAbs(fileEntry.Path) {
 					filePakage := strings.TrimSuffix(cuName, cu.lineInfo.IncludeDirs[fileEntry.DirIdx])
 					absPath := bi.buildModInfoMap[filePakage] + fileEntry.Path
 					cu.lineInfo.Lookup[absPath] = fileEntry
