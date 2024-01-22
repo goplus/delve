@@ -713,6 +713,15 @@ func (bi *BinaryInfo) LoadBinaryInfo(path string, entryPoint uint64, debugInfoDi
 	return bi.AddImage(path, entryPoint)
 }
 
+func getModuleCacheAbsPath(mod module.Version, defaultPath string) string {
+	modPath, err := modcache.Path(mod)
+	if err != nil {
+		// not find? use moduleName(unique)
+		return defaultPath
+	}
+	return modPath + "/"
+}
+
 func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 	if len(bi.buildModInfoMap) == 0 {
 		bi.buildModInfoMap = make(map[string]string)
@@ -722,7 +731,7 @@ func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 		currentDir := binfo.Path + "/"
 		for i := len(fileSplit) - 1; i > 0; i-- {
 			temp := strings.Join(fileSplit[:i], "/") + "/"
-			_, err := os.Open(temp + "go.mod")
+			_, err := os.Stat(temp + "go.mod")
 			if err == nil {
 				currentDir = temp
 				break
@@ -734,7 +743,6 @@ func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 		for _, m := range binfo.Deps {
 			curModuleName := m.Path + "/"
 			absPath := curModuleName
-			var err error
 			if m.Replace != nil {
 				if filepath.IsAbs(m.Replace.Path) {
 					absPath = m.Replace.Path
@@ -742,26 +750,23 @@ func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 					absPath = filepath.Join(currentDir, m.Replace.Path)
 					fi, err := os.Stat(absPath)
 					if err != nil || !fi.IsDir() {
-						absPath = curModuleName
+						absPath = getModuleCacheAbsPath(module.Version{
+							Path:    m.Replace.Path,
+							Version: m.Replace.Version,
+						}, m.Path+"/")
 					}
 				}
 			} else {
-				aa := module.Version{
+				absPath = getModuleCacheAbsPath(module.Version{
 					Path:    m.Path,
 					Version: m.Version,
-				}
-				absPath, err = modcache.Path(aa)
-				if err != nil {
-					// not find? use moduleName(unique)
-					bi.buildModInfoMap[curModuleName] = curModuleName
-					continue
-				}
+				}, curModuleName)
 			}
 
 			if runtime.GOOS == "windows" {
 				absPath = filepath.ToSlash(absPath)
 			}
-			bi.buildModInfoMap[curModuleName] = absPath + "/"
+			bi.buildModInfoMap[curModuleName] = absPath
 		}
 	}
 	return bi.buildModInfoMap
