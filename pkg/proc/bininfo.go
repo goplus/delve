@@ -714,9 +714,6 @@ func (bi *BinaryInfo) LoadBinaryInfo(path string, entryPoint uint64, debugInfoDi
 }
 
 func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
-	// TODO: getBinary Build Info: mod info
-	//
-	// buildinfo.ReadFile()
 	if len(bi.buildModInfoMap) == 0 {
 		bi.buildModInfoMap = make(map[string]string)
 		binfo, _ := buildinfo.ReadFile(path)
@@ -736,20 +733,35 @@ func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
 
 		for _, m := range binfo.Deps {
 			curModuleName := m.Path + "/"
-			aa := module.Version{
-				Path:    m.Path,
-				Version: m.Version,
+			absPath := curModuleName
+			var err error
+			if m.Replace != nil {
+				if filepath.IsAbs(m.Replace.Path) {
+					absPath = m.Replace.Path
+				} else {
+					absPath = filepath.Join(currentDir, m.Replace.Path)
+					fi, err := os.Stat(absPath)
+					if err != nil || !fi.IsDir() {
+						absPath = curModuleName
+					}
+				}
+			} else {
+				aa := module.Version{
+					Path:    m.Path,
+					Version: m.Version,
+				}
+				absPath, err = modcache.Path(aa)
+				if err != nil {
+					// not find? use moduleName(unique)
+					bi.buildModInfoMap[curModuleName] = curModuleName
+					continue
+				}
 			}
-			cupath, err := modcache.Path(aa)
-			if err != nil {
-				// not find? use moduleName(unique)
-				bi.buildModInfoMap[curModuleName] = curModuleName
-				continue
-			}
+
 			if runtime.GOOS == "windows" {
-				cupath = filepath.ToSlash(cupath)
+				absPath = filepath.ToSlash(absPath)
 			}
-			bi.buildModInfoMap[curModuleName] = cupath + "/"
+			bi.buildModInfoMap[curModuleName] = absPath + "/"
 		}
 	}
 	return bi.buildModInfoMap
