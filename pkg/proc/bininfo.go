@@ -2360,11 +2360,16 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 			if runtime.GOOS == "windows" {
 				cuName = filepath.ToSlash(cuName)
 			}
+			cuName = strings.TrimSuffix(cuName, "_test")
 			for _, fileEntry := range cu.lineInfo.FileNames {
 				fileExt := filepath.Ext(fileEntry.Path)
 				if fileExt != "" && fileExt != ".go" && fileExt != ".s" && !filepath.IsAbs(fileEntry.Path) {
 					filePakage := strings.TrimSuffix(cuName, cu.lineInfo.IncludeDirs[fileEntry.DirIdx])
-					absPath := bi.buildModInfoMap[filePakage] + fileEntry.Path
+					absPath := bi.buildModInfoMap[filePakage]
+					if absPath == "" {
+						absPath = bi.buildModInfoMap[filePakage+"/"]
+					}
+					absPath += fileEntry.Path
 					cu.lineInfo.Lookup[absPath] = fileEntry
 					delete(cu.lineInfo.Lookup, fileEntry.Path)
 					fileEntry.Path = absPath
