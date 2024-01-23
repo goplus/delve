@@ -335,9 +335,12 @@ func TestStep(t *testing.T) {
 }
 func TestSources(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestProcess("goptest/", t, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
+	withTestProcessArgs("goptest/", t, ".", []string{"test"}, 0, func(p *proc.Target, grp *proc.TargetGroup, fixture protest.Fixture) {
 		for i, v := range p.BinInfo().Sources {
-			t.Log(i, v)
+			if strings.HasSuffix(v, ".gop") {
+				t.Log(i, v)
+			}
+
 		}
 	})
 }
