@@ -2,6 +2,7 @@ package proc
 
 import (
 	"bytes"
+	"debug/buildinfo"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -16,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,7 +36,9 @@ import (
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc/debuginfod"
 	"github.com/go-delve/gore"
+	"github.com/goplus/mod/modcache"
 	"github.com/hashicorp/golang-lru/simplelru"
+	"golang.org/x/mod/module"
 )
 
 const (
@@ -111,7 +115,8 @@ type BinaryInfo struct {
 	// Go 1.17 register ABI is enabled.
 	regabi bool
 
-	logger logflags.Logger
+	logger          logflags.Logger
+	buildModInfoMap map[string]string
 }
 
 var (
@@ -702,7 +707,7 @@ func (bi *BinaryInfo) LoadBinaryInfo(path string, entryPoint uint64, debugInfoDi
 	}
 
 	bi.DebugInfoDirectories = debugInfoDirs
-
+	bi.PackagePathMap(path)
 	return bi.AddImage(path, entryPoint)
 }
 
@@ -719,6 +724,64 @@ func loadBinaryInfo(bi *BinaryInfo, image *Image, path string, entryPoint uint64
 		return loadBinaryInfoMacho(bi, image, path, entryPoint, &wg)
 	}
 	return errors.New("unsupported operating system")
+}
+func getModuleCacheAbsPath(mod module.Version, defaultPath string) string {
+	modPath, err := modcache.Path(mod)
+	if err != nil {
+		// not find? use moduleName(unique)
+		return defaultPath
+	}
+	return modPath + "/"
+}
+func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
+	if len(bi.buildModInfoMap) == 0 {
+		bi.buildModInfoMap = make(map[string]string)
+		binfo, _ := buildinfo.ReadFile(path)
+		fileSplit := strings.Split((filepath.ToSlash(filepath.Dir(path)) + "/"), "/")
+		// not find abspath, use moduleName
+		currentDir := binfo.Path + "/"
+		for i := len(fileSplit) - 1; i > 0; i-- {
+			temp := strings.Join(fileSplit[:i], "/") + "/"
+			_, err := os.Stat(temp + "go.mod")
+			if err == nil {
+				currentDir = temp
+				break
+			}
+		}
+		bi.buildModInfoMap["main"] = currentDir
+		bi.buildModInfoMap[binfo.Path+"/"] = currentDir
+
+		for _, m := range binfo.Deps {
+			curModuleName := m.Path + "/"
+			absPath := curModuleName
+			if m.Replace != nil {
+				fi, err := os.Stat(m.Replace.Path)
+				if filepath.IsAbs(m.Replace.Path) && err == nil {
+					absPath = m.Replace.Path
+				} else if strings.HasPrefix(m.Replace.Path, ".") {
+					absPath = filepath.Join(currentDir, m.Replace.Path)
+					fi, err = os.Stat(absPath)
+				}
+				if err != nil || !fi.IsDir() {
+					absPath = getModuleCacheAbsPath(module.Version{
+						Path:    m.Replace.Path,
+						Version: m.Replace.Version,
+					}, m.Path+"/")
+				}
+			} else {
+				absPath = getModuleCacheAbsPath(module.Version{
+					Path:    m.Path,
+					Version: m.Version,
+				}, curModuleName)
+			}
+
+			if runtime.GOOS == "windows" {
+				absPath = filepath.ToSlash(absPath)
+			}
+			bi.buildModInfoMap[curModuleName] = absPath
+		}
+	}
+	return bi.buildModInfoMap
 }
 
 // GStructOffset returns the offset of the G
@@ -2268,7 +2331,31 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 			if cu.isgo && gopkg != "" {
 				bi.PackageMap[gopkg] = append(bi.PackageMap[gopkg], escapePackagePath(strings.ReplaceAll(cu.name, "\\", "/")))
 			}
+			// change gop file path
+			if cu.lineInfo != nil {
+				cuName := cu.name
+				if runtime.GOOS == "windows" {
+					cuName = filepath.ToSlash(cuName)
+				}
+				// filter test file suffix: support test debug
+				cuName = strings.TrimSuffix(cuName, "_test")
+				for _, fileEntry := range cu.lineInfo.FileNames {
+					fileExt := filepath.Ext(fileEntry.Path)
+					if fileExt != "" && fileExt != ".go" && fileExt != ".s" && !filepath.IsAbs(fileEntry.Path) {
+						filePakage := strings.TrimSuffix(cuName, cu.lineInfo.IncludeDirs[fileEntry.DirIdx])
+						absPath := bi.buildModInfoMap[filePakage]
+						if absPath == "" {
+							absPath = bi.buildModInfoMap[filePakage+"/"]
+						}
+						absPath += fileEntry.Path
+						cu.lineInfo.Lookup[absPath] = fileEntry
+						delete(cu.lineInfo.Lookup, fileEntry.Path)
+						fileEntry.Path = absPath
+					}
+				}
+			}
 			image.compileUnits = append(image.compileUnits, cu)
+
 			if entry.Children {
 				bi.loadDebugInfoMapsCompileUnit(ctxt, image, reader, cu)
 			}
