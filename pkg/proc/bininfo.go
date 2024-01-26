@@ -115,7 +115,8 @@ type BinaryInfo struct {
 	// Go 1.17 register ABI is enabled.
 	regabi bool
 
-	logger          logflags.Logger
+	logger logflags.Logger
+	// pkgPath => absPkgDir: to mapping gop sources
 	buildModInfoMap map[string]string
 }
 
@@ -707,7 +708,7 @@ func (bi *BinaryInfo) LoadBinaryInfo(path string, entryPoint uint64, debugInfoDi
 	}
 
 	bi.DebugInfoDirectories = debugInfoDirs
-	bi.PackagePathMap(path)
+	bi.packagePathMap(path)
 	return bi.AddImage(path, entryPoint)
 }
 
@@ -725,61 +726,65 @@ func loadBinaryInfo(bi *BinaryInfo, image *Image, path string, entryPoint uint64
 	}
 	return errors.New("unsupported operating system")
 }
-func getModuleCacheAbsPath(mod module.Version, defaultPath string) string {
-	modPath, err := modcache.Path(mod)
-	if err != nil {
-		// not find? use moduleName(unique)
-		return defaultPath
+func (bi *BinaryInfo) packagePathMap(path string) map[string]string {
+	if len(bi.buildModInfoMap) > 0 {
+		return bi.buildModInfoMap
 	}
-	return modPath + "/"
-}
-func (bi *BinaryInfo) PackagePathMap(path string) map[string]string {
-	if len(bi.buildModInfoMap) == 0 {
-		bi.buildModInfoMap = make(map[string]string)
-		binfo, _ := buildinfo.ReadFile(path)
-		fileSplit := strings.Split((filepath.ToSlash(filepath.Dir(path)) + "/"), "/")
-		// not find abspath, use moduleName
-		currentDir := binfo.Path + "/"
-		for i := len(fileSplit) - 1; i > 0; i-- {
-			temp := strings.Join(fileSplit[:i], "/") + "/"
-			_, err := os.Stat(temp + "go.mod")
+	bi.buildModInfoMap = make(map[string]string)
+	binfo, _ := buildinfo.ReadFile(path)
+	fileSplit := strings.Split((filepath.ToSlash(filepath.Dir(path)) + "/"), "/")
+	// not find abspath, use moduleName
+	currentDir := binfo.Path + "/"
+	for i := len(fileSplit) - 1; i > 0; i-- {
+		temp := strings.Join(fileSplit[:i], "/") + "/"
+		_, err := os.Stat(temp + "go.mod")
+		if err == nil {
+			currentDir = temp
+			break
+		}
+	}
+	bi.buildModInfoMap["main"] = currentDir
+	bi.buildModInfoMap[binfo.Path+"/"] = currentDir
+
+	for _, m := range binfo.Deps {
+		curModuleName := m.Path + "/"
+		absPath := curModuleName
+		if m.Replace != nil {
+			if filepath.IsAbs(m.Replace.Path) {
+				absPath = m.Replace.Path
+			} else if strings.HasPrefix(m.Replace.Path, ".") {
+				absPath = filepath.Join(currentDir, m.Replace.Path)
+			}
+			fi, err := os.Stat(absPath)
+			if err != nil || !fi.IsDir() {
+				modPath, err := modcache.Path(module.Version{
+					Path:    m.Replace.Path,
+					Version: m.Replace.Version,
+				})
+				if err == nil {
+					absPath = modPath
+				} else {
+					bi.logger.Warnf(
+						"Unable to find replacement path: %s, so the  a source path prefixed with %s", m.Replace.Path, curModuleName)
+				}
+			}
+		} else {
+			modPath, err := modcache.Path(module.Version{
+				Path:    m.Path,
+				Version: m.Version,
+			})
 			if err == nil {
-				currentDir = temp
-				break
-			}
-		}
-		bi.buildModInfoMap["main"] = currentDir
-		bi.buildModInfoMap[binfo.Path+"/"] = currentDir
-
-		for _, m := range binfo.Deps {
-			curModuleName := m.Path + "/"
-			absPath := curModuleName
-			if m.Replace != nil {
-				fi, err := os.Stat(m.Replace.Path)
-				if filepath.IsAbs(m.Replace.Path) && err == nil {
-					absPath = m.Replace.Path
-				} else if strings.HasPrefix(m.Replace.Path, ".") {
-					absPath = filepath.Join(currentDir, m.Replace.Path)
-					fi, err = os.Stat(absPath)
-				}
-				if err != nil || !fi.IsDir() {
-					absPath = getModuleCacheAbsPath(module.Version{
-						Path:    m.Replace.Path,
-						Version: m.Replace.Version,
-					}, m.Path+"/")
-				}
+				absPath = modPath
 			} else {
-				absPath = getModuleCacheAbsPath(module.Version{
-					Path:    m.Path,
-					Version: m.Version,
-				}, curModuleName)
+				bi.logger.Warnf(
+					"Unable to find pkg path, so the  a source path prefixed with %s", curModuleName)
 			}
-
-			if runtime.GOOS == "windows" {
-				absPath = filepath.ToSlash(absPath)
-			}
-			bi.buildModInfoMap[curModuleName] = absPath
 		}
+
+		if runtime.GOOS == "windows" {
+			absPath = filepath.ToSlash(absPath)
+		}
+		bi.buildModInfoMap[curModuleName] = absPath
 	}
 	return bi.buildModInfoMap
 }
