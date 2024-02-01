@@ -33,7 +33,7 @@ github.com/go-delve/liner
 # github.com/google/go-dap v0.11.0
 ## explicit; go 1.13
 github.com/google/go-dap
-# github.com/goplus/mod v0.12.3
+# github.com/goplus/mod v0.13.0
 ## explicit; go 1.16
 github.com/goplus/mod
 github.com/goplus/mod/gopmod
@@ -56,7 +56,7 @@ github.com/mattn/go-isatty
 # github.com/mattn/go-runewidth v0.0.13
 ## explicit; go 1.9
 github.com/mattn/go-runewidth
-# github.com/qiniu/x v1.13.2
+# github.com/qiniu/x v1.13.3
 ## explicit; go 1.13
 github.com/qiniu/x/errors
 # github.com/rivo/uniseg v0.2.0

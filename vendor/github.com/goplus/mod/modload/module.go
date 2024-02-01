@@ -129,10 +129,7 @@ func newGoMod(gomod, modPath, goVer string) *gomodfile.File {
 }
 
 func newGopMod(gopmod, gopVer string) *modfile.File {
-	opt := new(modfile.File)
-	opt.AddGopStmt(gopVer)
-	opt.Syntax.Name = gopmod
-	return opt
+	return modfile.New(gopmod, gopVer)
 }
 
 // fixVersion returns a modfile.VersionFixer implemented using the Query function.
@@ -206,11 +203,37 @@ func LoadFromEx(gomod, gopmod string, readFile func(string) ([]byte, error)) (p 
 	return Module{f, opt}, nil
 }
 
+func (p Module) AddRequire(path, vers string, hasProj bool) error {
+	f := p.File
+	if err := f.AddRequire(path, vers); err != nil {
+		return err
+	}
+	for _, r := range f.Require {
+		if r.Mod.Path == path {
+			if !isClass(r) {
+				addClass(p.Opt, r)
+			}
+			break
+		}
+	}
+	return nil
+}
+
 func importClassfileFromGoMod(opt *modfile.File, f *gomodfile.File) {
 	for _, r := range f.Require {
 		if isClass(r) {
-			opt.AddImport(r.Mod.Path)
+			opt.ClassMods = append(opt.ClassMods, r.Mod.Path)
 		}
+	}
+}
+
+func addClass(opt *modfile.File, r *gomodfile.Require) {
+	if line := r.Syntax; line != nil {
+		line.Suffix = append(line.Suffix, modfile.Comment{
+			Token:  "//gop:class", // without trailing newline
+			Suffix: true,          // an end of line (not whole line) comment
+		})
+		opt.ClassMods = append(opt.ClassMods, r.Mod.Path)
 	}
 }
 
@@ -237,29 +260,26 @@ func (p Module) HasProject() bool {
 }
 
 func hasGopExtended(opt *modfile.File) bool {
-	return len(opt.Projects) > 0 || len(opt.Import) > 0
+	return len(opt.Projects) > 0
 }
 
 // Save saves all changes of this module.
 func (p Module) Save() (err error) {
-	modfile := p.Modfile()
-	if modfile == "" {
+	modf := p.Modfile()
+	if modf == "" {
 		return ErrSaveDefault
 	}
 	data, err := p.Format()
 	if err != nil {
 		return
 	}
-	err = os.WriteFile(modfile, data, 0644)
+	err = os.WriteFile(modf, data, 0644)
 	if err != nil {
 		return
 	}
 
 	if opt := p.Opt; hasGopExtended(opt) {
-		data, err = opt.Format()
-		if err != nil {
-			return
-		}
+		data := modfile.Format(opt.Syntax)
 		err = os.WriteFile(opt.Syntax.Name, data, 0644)
 	}
 	return
@@ -379,7 +399,7 @@ func getVerb(e modfile.Expr) string {
 
 const (
 	defaultGoVer  = "1.18"
-	defaultGopVer = "1.1"
+	defaultGopVer = "1.2"
 )
 
 // Default represents the default gop.mod object.
