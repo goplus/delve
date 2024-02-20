@@ -2207,6 +2207,25 @@ func relPathToAbsPathByPackage(imageMod *gopmod.Module, filePakage string, relPa
 	return absPath
 }
 
+// Multi level directory search mod
+func getImageMod(path string) (imageMod *gopmod.Module) {
+	path = filepath.Clean(filepath.ToSlash(path))
+	for {
+		base := filepath.Base(path)
+		if base == "." {
+			return
+		}
+		if _, err := os.Stat(path + "/go.mod"); err == nil {
+			break
+		}
+		path = filepath.Clean(strings.TrimSuffix(path, base))
+	}
+	if mod, err := gopmod.Load(path); err == nil {
+		imageMod = mod
+	}
+	return
+}
+
 func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineBytes []byte, wg *sync.WaitGroup, cont func()) {
 	if wg != nil {
 		defer wg.Done()
@@ -2296,9 +2315,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 
 			if cu.lineInfo != nil {
 				if imageMod == nil {
-					if mod, err := gopmod.Load(filepath.Dir(image.Path)); err == nil {
-						imageMod = mod
-					}
+					imageMod = getImageMod(image.Path)
 				}
 				if imageMod != nil {
 					cuName := cu.name
