@@ -10,7 +10,7 @@ require (
 	github.com/go-delve/gore v0.11.8
 	github.com/go-delve/liner v1.2.3-0.20231231155935-4726ab1d7f62
 	github.com/google/go-dap v0.11.0
-	github.com/goplus/mod v0.13.7
+	github.com/goplus/mod v0.13.8
 	github.com/hashicorp/golang-lru v1.0.2
 	github.com/mattn/go-colorable v0.1.13
 	github.com/mattn/go-isatty v0.0.20
@@ -28,7 +28,7 @@ require (
 	github.com/cpuguy83/go-md2man/v2 v2.0.2 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/mattn/go-runewidth v0.0.13 // indirect
-	github.com/qiniu/x v1.13.8 // indirect
+	github.com/qiniu/x v1.13.9 // indirect
 	github.com/rivo/uniseg v0.2.0 // indirect
 	github.com/russross/blackfriday/v2 v2.1.0 // indirect
 	golang.org/x/exp v0.0.0-20230224173230-c95f2b4c22f2 // indirect
