@@ -5,7 +5,7 @@ go 1.21
 require (
 	github.com/cilium/ebpf v0.11.0
 	github.com/cosiner/argv v0.1.0
-	github.com/creack/pty v1.1.20
+	github.com/creack/pty v1.1.23
 	github.com/derekparker/trie v0.0.0-20230829180723-39f4de51ef7d
 	github.com/go-delve/gore v0.11.8
 	github.com/go-delve/liner v1.2.3-0.20231231155935-4726ab1d7f62
