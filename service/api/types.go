@@ -133,6 +133,11 @@ type Breakpoint struct {
 	Disabled bool `json:"disabled"`
 
 	UserData interface{} `json:"-"`
+
+	// RootFuncName is the Root function from where tracing needs to be done
+	RootFuncName string
+	// TraceFollowCalls indicates the Depth of tracing
+	TraceFollowCalls int
 }
 
 // ValidBreakpointName returns an error if
@@ -321,12 +326,12 @@ type Variable struct {
 	// Function variables will store the name of the function in this field
 	Value string `json:"value"`
 
-	// Number of elements in an array or a slice, number of keys for a map, number of struct members for a struct, length of strings
+	// Number of elements in an array or a slice, number of keys for a map, number of struct members for a struct, length of strings, number of captured variables for functions
 	Len int64 `json:"len"`
 	// Cap value for slices
 	Cap int64 `json:"cap"`
 
-	// Array and slice elements, member fields of structs, key/value pairs of maps, value of complex numbers
+	// Array and slice elements, member fields of structs, key/value pairs of maps, value of complex numbers, captured variables of functions.
 	// The Name field in this slice will always be the empty string except for structs (when it will be the field name) and for complex numbers (when it will be "real" and "imaginary")
 	// For maps each map entry will have to items in this slice, even numbered items will represent map keys and odd numbered items will represent their values
 	// This field's length is capped at proc.maxArrayValues for slices and arrays and 2*proc.maxArrayValues for maps, in the circumstances where the cap takes effect len(Children) != Len
@@ -456,8 +461,12 @@ const (
 	ReverseStepOut = "reverseStepOut"
 	// StepInstruction continues for exactly 1 cpu instruction.
 	StepInstruction = "stepInstruction"
+	// NextInstruction continues for 1 cpu instruction, skipping over CALL instructions.
+	NextInstruction = "nextInstruction"
 	// ReverseStepInstruction reverses execution for exactly 1 cpu instruction.
 	ReverseStepInstruction = "reverseStepInstruction"
+	// ReverseNextInstruction reverses execution for 1 cpu instruction, skipping over CALL instructions.
+	ReverseNextInstruction = "reverseNextInstruction"
 	// Next continues to the next source line, not entering function calls.
 	Next = "next"
 	// ReverseNext continues backward to the previous line of source code, not entering function calls.
@@ -667,4 +676,11 @@ type Target struct {
 	Pid           int
 	CmdLine       string
 	CurrentThread *Thread
+}
+
+// GuessSubstitutePathIn are the input parameters used to guess a substitute-path configuration automatically.
+type GuessSubstitutePathIn struct {
+	ImportPathOfMainPackage string
+	ClientGOROOT            string
+	ClientModuleDirectories map[string]string
 }

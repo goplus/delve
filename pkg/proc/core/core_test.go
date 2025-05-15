@@ -28,7 +28,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "unknown build mode %q", buildMode)
 		os.Exit(1)
 	}
-	os.Exit(test.RunTestsWithFixtures(m))
+	test.RunTestsWithFixtures(m)
 }
 
 func assertNoError(err error, t testing.TB, s string) {
@@ -205,7 +205,7 @@ func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
 	if buildMode == "pie" {
 		buildFlags = test.BuildModePIE
 	}
-	fix := test.BuildFixture(name, buildFlags)
+	fix := test.BuildFixture(t, name, buildFlags)
 	bashCmd := fmt.Sprintf("cd %v && ulimit -c unlimited && GOTRACEBACK=crash %v %s", tempDir, fix.Path, args)
 	exec.Command("bash", "-c", bashCmd).Run()
 	cores, err := filepath.Glob(path.Join(tempDir, "core*"))
@@ -213,8 +213,13 @@ func withCoreFile(t *testing.T, name, args string) *proc.TargetGroup {
 	case err != nil || len(cores) > 1:
 		t.Fatalf("Got %v, wanted one file named core* in %v", cores, tempDir)
 	case len(cores) == 0:
-		t.Skipf("core file was not produced, could not run test")
-		return nil
+		cores = []string{fix.Path + ".dump"}
+		err := exec.Command("coredumpctl", "--output="+cores[0], "dump", fix.Path).Run()
+		if err != nil {
+			t.Skipf("core file was not produced, could not run test, coredumpctl error: %v", err)
+			return nil
+		}
+		test.PathsToRemove = append(test.PathsToRemove, cores[0])
 	}
 	corePath := cores[0]
 
@@ -244,12 +249,8 @@ func logRegisters(t *testing.T, regs proc.Registers, arch *proc.Arch) {
 }
 
 func TestCore(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
-		t.Skip("unsupported")
-	}
-	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
-		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
-	}
+	mustSupportCore(t)
+
 	grp := withCoreFile(t, "panic", "")
 	p := grp.Selected
 
@@ -404,12 +405,8 @@ func TestCoreFpRegisters(t *testing.T) {
 }
 
 func TestCoreWithEmptyString(t *testing.T) {
-	if runtime.GOOS != "linux" || runtime.GOARCH == "386" {
-		t.Skip("unsupported")
-	}
-	if runtime.GOOS == "linux" && os.Getenv("CI") == "true" && buildMode == "pie" {
-		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
-	}
+	mustSupportCore(t)
+
 	grp := withCoreFile(t, "coreemptystring", "")
 	p := grp.Selected
 
@@ -453,7 +450,7 @@ func TestMinidump(t *testing.T) {
 	if buildMode == "pie" {
 		buildFlags = test.BuildModePIE
 	}
-	fix := test.BuildFixture("sleep", buildFlags)
+	fix := test.BuildFixture(t, "sleep", buildFlags)
 	mdmpPath := procdump(t, fix.Path)
 
 	grp, err := OpenCore(mdmpPath, fix.Path, []string{})
@@ -524,4 +521,23 @@ func procdump(t *testing.T, exePath string) string {
 
 	t.Fatalf("could not find dump file")
 	return ""
+}
+
+func mustSupportCore(t *testing.T) {
+	t.Helper()
+
+	if runtime.GOOS != "linux" {
+		t.Skip("test must be run on linux")
+	}
+
+	switch runtime.GOARCH {
+	case "386", "ppc64le":
+		t.Skip("unsupported")
+	case "loong64":
+		t.Skip("could not read runtime.sigtrampgo context")
+	}
+
+	if os.Getenv("CI") == "true" && buildMode == "pie" {
+		t.Skip("disabled on linux, Github Actions, with PIE buildmode")
+	}
 }

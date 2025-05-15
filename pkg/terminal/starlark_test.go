@@ -16,6 +16,7 @@ func TestStarlarkExamples(t *testing.T) {
 		t.Run("echo_expr", func(t *testing.T) { testStarlarkEchoExpr(t, term) })
 		t.Run("find_array", func(t *testing.T) { testStarlarkFindArray(t, term) })
 		t.Run("map_iteration", func(t *testing.T) { testStarlarkMapIteration(t, term) })
+		t.Run("amend_breakpoint", func(t *testing.T) { testStarlarkAmendBreakpoint(t, term) })
 	})
 }
 
@@ -35,6 +36,19 @@ func testStarlarkExampleCreateBreakpointmain(t *testing.T, term *FakeTerminal) {
 	t.Logf("breakpoints: %q", out2p2)
 	if !strings.Contains(out2p2, "main.afunc1") {
 		t.Fatalf("create_breakpoint_runtime_func example failed")
+	}
+	bps, err := term.client.ListBreakpoints(false)
+	if err != nil {
+		t.Fatalf("Could not clear breakpoints: %v\n", err)
+	}
+	for _, bp := range bps {
+		if bp.ID <= 0 {
+			continue
+		}
+		_, err = term.client.ClearBreakpoint(bp.ID)
+		if err != nil {
+			t.Fatalf("Could not clear breakpoints: %v\n", err)
+		}
 	}
 }
 
@@ -118,6 +132,16 @@ func testStarlarkMapIteration(t *testing.T, term *FakeTerminal) {
 	t.Logf("%s", out)
 }
 
+func testStarlarkAmendBreakpoint(t *testing.T, term *FakeTerminal) {
+	term.MustExec("break afuncbreak main.afunc")
+	out := term.MustExec("source " + findStarFile("amend_breakpoint"))
+	t.Logf("%s", out)
+	if !strings.Contains(out, "Stacktrace:2") || !strings.Contains(out, `HitCond:"== 2"`) {
+		t.Fatalf("wrong output")
+	}
+	term.MustExec("clear afuncbreak")
+}
+
 func TestStarlarkVariable(t *testing.T) {
 	withTestTerminal("testvariables2", t, func(term *FakeTerminal) {
 		term.MustExec("continue")
@@ -144,6 +168,14 @@ func TestStarlarkVariable(t *testing.T) {
 			{`v = eval({"GoroutineID": -1}, "as1").Variable; print(v.Value.A)`, "1"},
 			{`v = eval(cur_scope(), "as1").Variable; print(v.Value.A)`, "1"},
 			{`v = eval(None, "as1", default_load_config()).Variable; print(v.Value.A)`, "1"},
+
+			// named constant values
+			{`v = eval(None, "enum1").Variable; print(v.Value)`, "255"},
+			{`v = eval(None, "enum2").Variable; print(v.Value)`, "hi"},
+			{`v = eval(None, "enum3").Variable; print(v.Value)`, "42"},
+			{`v = eval(None, "enum4").Variable; print(v.Value)`, "9001"},
+			{`v = eval(None, "enum5").Variable; print(v.Value)`, "True"},
+			{`v = eval(None, "enum6").Variable; print(v.Value)`, "3.14"},
 
 			// From starlark.md's examples
 			{`v = eval(None, "s2").Variable; print(v.Value[0])`, "main.astruct {A: 1, B: 2}"},
@@ -223,5 +255,48 @@ v.Children[0].Children[0].Value.XXX
 				}
 			})
 		}
+	})
+}
+
+func TestStarlarkChainBreakpointsExample(t *testing.T) {
+	withTestTerminal("bphitcountchain", t, func(term *FakeTerminal) {
+		term.MustExec("source " + findStarFile("chain_breakpoints"))
+		term.MustExec("break main.breakfunc1")
+		term.MustExec("break main.breakfunc2")
+		term.MustExec("break main.breakfunc3")
+		term.MustExec("chain 1 2 3")
+		out := term.MustExec("breakpoints")
+		t.Log(out)
+
+		numphys := func(id int) int {
+			bp, err := term.client.GetBreakpoint(id)
+			if err != nil {
+				t.Fatalf("Error getting breakpoint %d: %v", id, err)
+			}
+			return len(bp.Addrs)
+		}
+
+		assertPhysCount := func(lbp1cnt, lbp2cnt, lbp3cnt int) {
+			t.Helper()
+			t.Logf("lbp1: %d lbp2: %d lbp3: %d", numphys(1), numphys(2), numphys(3))
+			if numphys(1) != lbp1cnt || numphys(2) != lbp2cnt || numphys(3) != lbp3cnt {
+				t.Fatal("Wrong number of physical breakpoints")
+			}
+		}
+
+		assertPhysCount(1, 0, 0)
+
+		term.MustExec("continue")
+		listIsAt(t, term, "frame 1 list", 21, -1, -1)
+
+		term.MustExec("continue")
+		listIsAt(t, term, "frame 1 list", 25, -1, -1)
+
+		assertPhysCount(0, 1, 0)
+
+		term.MustExec("continue")
+		listIsAt(t, term, "frame 1 list", 28, -1, -1)
+
+		assertPhysCount(0, 0, 1)
 	})
 }

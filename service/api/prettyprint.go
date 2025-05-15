@@ -176,6 +176,15 @@ func (v *Variable) writeTo(buf io.Writer, flags prettyFlags, indent, fmtstr stri
 			fmt.Fprint(buf, "nil")
 		} else {
 			fmt.Fprintf(buf, "%s", v.Value)
+			if flags.newlines() && len(v.Children) > 0 {
+				fmt.Fprintf(buf, " {\n")
+				for i := range v.Children {
+					fmt.Fprintf(buf, "%s%s%s %s = ", indent, indentString, v.Children[i].Name, v.Children[i].typeStr(flags))
+					v.Children[i].writeTo(buf, flags.set(prettyTop, false).set(prettyIncludeType, false), indent+indentString, fmtstr)
+					fmt.Fprintf(buf, "\n")
+				}
+				fmt.Fprintf(buf, "%s}", indent)
+			}
 		}
 	default:
 		v.writeBasicType(buf, fmtstr)
@@ -479,7 +488,6 @@ func (v *Variable) writeSliceOrArrayTo(buf io.Writer, flags prettyFlags, indent,
 // `format` specifies the data format (or data type), `size` specifies size of each data,
 // like 4byte integer, 1byte character, etc. `count` specifies the number of values.
 func PrettyExamineMemory(address uintptr, memArea []byte, isLittleEndian bool, format byte, size int) string {
-
 	var (
 		cols      int
 		colFormat string
@@ -564,7 +572,13 @@ func digits(n int) int {
 	return int(math.Floor(math.Log10(float64(n)))) + 1
 }
 
-func PrintStack(formatPath func(string) string, out io.Writer, stack []Stackframe, ind string, offsets bool, include func(Stackframe) bool) {
+type StackTraceColors struct {
+	FunctionColor string
+	BasenameColor string
+	NormalColor   string
+}
+
+func PrintStack(formatPath func(string) string, out io.Writer, stack []Stackframe, ind string, offsets bool, stc StackTraceColors, include func(Stackframe) bool) {
 	if len(stack) == 0 {
 		return
 	}
@@ -577,8 +591,22 @@ func PrintStack(formatPath func(string) string, out io.Writer, stack []Stackfram
 		extranl = extranl || (len(stack[i].Defers) > 0) || (len(stack[i].Arguments) > 0) || (len(stack[i].Locals) > 0)
 	}
 
+	fileLine := func(file string, line int) string {
+		file = formatPath(file)
+		if stc.BasenameColor == "" {
+			return fmt.Sprintf("%s:%d", file, line)
+		}
+		slash := strings.LastIndex(file, "/")
+		if slash < 0 {
+			slash = 0
+		} else {
+			slash++
+		}
+		return fmt.Sprintf("%s%s%s:%d%s", file[:slash], stc.BasenameColor, file[slash:], line, stc.NormalColor)
+	}
+
 	d := digits(len(stack) - 1)
-	fmtstr := "%s%" + strconv.Itoa(d) + "d  0x%016x in %s\n"
+	fmtstr := "%s%" + strconv.Itoa(d) + "d  0x%016x in " + stc.FunctionColor + "%s" + stc.NormalColor + "\n"
 	s := ind + strings.Repeat(" ", d+2+len(ind))
 
 	for i := range stack {
@@ -590,7 +618,7 @@ func PrintStack(formatPath func(string) string, out io.Writer, stack []Stackfram
 			continue
 		}
 		fmt.Fprintf(out, fmtstr, ind, i, stack[i].PC, stack[i].Function.Name())
-		fmt.Fprintf(out, "%sat %s:%d\n", s, formatPath(stack[i].File), stack[i].Line)
+		fmt.Fprintf(out, "%sat %s\n", s, fileLine(stack[i].File, stack[i].Line))
 
 		if offsets {
 			fmt.Fprintf(out, "%sframe: %+#x frame pointer %+#x\n", s, stack[i].FrameOffset, stack[i].FramePointerOffset)
@@ -603,9 +631,9 @@ func PrintStack(formatPath func(string) string, out io.Writer, stack []Stackfram
 				fmt.Fprintf(out, "%s(unreadable defer: %s)\n", deferHeader, d.Unreadable)
 				continue
 			}
-			fmt.Fprintf(out, "%s%#016x in %s\n", deferHeader, d.DeferredLoc.PC, d.DeferredLoc.Function.Name())
+			fmt.Fprintf(out, "%s%#016x in %s%s%s\n", deferHeader, d.DeferredLoc.PC, stc.FunctionColor, d.DeferredLoc.Function.Name(), stc.NormalColor)
 			fmt.Fprintf(out, "%sat %s:%d\n", s2, formatPath(d.DeferredLoc.File), d.DeferredLoc.Line)
-			fmt.Fprintf(out, "%sdeferred by %s at %s:%d\n", s2, d.DeferLoc.Function.Name(), formatPath(d.DeferLoc.File), d.DeferLoc.Line)
+			fmt.Fprintf(out, "%sdeferred by %s at %s\n", s2, d.DeferLoc.Function.Name(), fileLine(d.DeferLoc.File, d.DeferLoc.Line))
 		}
 
 		for j := range stack[i].Arguments {

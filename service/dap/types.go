@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/go-delve/delve/service/api"
 )
 
 // Launch debug sessions support the following modes:
@@ -248,6 +250,7 @@ func (m *SubstitutePath) UnmarshalJSON(data []byte) error {
 }
 
 // AttachConfig is the collection of attach request attributes recognized by DAP implementation.
+// 'processId' and 'waitFor' are mutually exclusive, and can't be specified at the same time.
 type AttachConfig struct {
 	// Acceptable values are:
 	//   "local": attaches to the local process with the given ProcessID.
@@ -256,8 +259,16 @@ type AttachConfig struct {
 	// Default is "local".
 	Mode string `json:"mode"`
 
-	// The numeric ID of the process to be debugged. Required and must not be 0.
+	// The numeric ID of the process to be debugged.
 	ProcessID int `json:"processId,omitempty"`
+
+	// Wait for a process with a name beginning with this prefix.
+	AttachWaitFor string `json:"waitFor,omitempty"`
+
+	// GuessSubstitutePath is used to automatically guess SubstitutePath if it
+	// is not specified explicitly. It should be copied from the output of
+	// 'dlv substitute-path-guess-helper'.
+	GuessSubstitutePath *api.GuessSubstitutePathIn `json:"guessSubstitutePath,omitempty"`
 
 	LaunchAttachCommonConfig
 }

@@ -18,7 +18,7 @@ func configureCmd(t *Term, ctx callContext, args string) error {
 	case "-save":
 		return config.SaveConfig(t.conf)
 	case "":
-		return fmt.Errorf("wrong number of arguments to \"config\"")
+		return errors.New("wrong number of arguments to \"config\"")
 	default:
 		err := configureSet(t, args)
 		if err != nil {
@@ -73,6 +73,17 @@ func configureSetSubstitutePath(t *Term, rest string) error {
 		t.conf.SubstitutePath = t.conf.SubstitutePath[:0]
 		return nil
 	}
+	if strings.TrimSpace(rest) == "-guess" {
+		rules, err := t.client.GuessSubstitutePath()
+		if err != nil {
+			return err
+		}
+		t.conf.SubstitutePath = t.conf.SubstitutePath[:0]
+		for _, rule := range rules {
+			t.conf.SubstitutePath = append(t.conf.SubstitutePath, config.SubstitutePathRule{From: rule[0], To: rule[1]})
+		}
+		rest = "" // print the result
+	}
 	argv := config.SplitQuotedFields(rest, '"')
 	if len(argv) == 2 && argv[0] == "-clear" {
 		argv = argv[1:]
@@ -103,7 +114,7 @@ func configureSetSubstitutePath(t *Term, rest string) error {
 		}
 		t.conf.SubstitutePath = append(t.conf.SubstitutePath, config.SubstitutePathRule{From: argv[0], To: argv[1]})
 	default:
-		return fmt.Errorf("too many arguments to \"config substitute-path\"")
+		return errors.New("too many arguments to \"config substitute-path\"")
 	}
 	return nil
 }

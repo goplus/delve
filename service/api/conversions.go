@@ -1,11 +1,8 @@
 package api
 
 import (
-	"bytes"
 	"fmt"
 	"go/constant"
-	"go/printer"
-	"go/token"
 	"reflect"
 	"sort"
 	"strconv"
@@ -19,21 +16,23 @@ import (
 // ConvertLogicalBreakpoint converts a proc.LogicalBreakpoint into an API breakpoint.
 func ConvertLogicalBreakpoint(lbp *proc.LogicalBreakpoint) *Breakpoint {
 	b := &Breakpoint{
-		ID:            lbp.LogicalID,
-		FunctionName:  lbp.FunctionName,
-		File:          lbp.File,
-		Line:          lbp.Line,
-		Name:          lbp.Name,
-		Tracepoint:    lbp.Tracepoint,
-		TraceReturn:   lbp.TraceReturn,
-		Stacktrace:    lbp.Stacktrace,
-		Goroutine:     lbp.Goroutine,
-		Variables:     lbp.Variables,
-		LoadArgs:      LoadConfigFromProc(lbp.LoadArgs),
-		LoadLocals:    LoadConfigFromProc(lbp.LoadLocals),
-		TotalHitCount: lbp.TotalHitCount,
-		Disabled:      !lbp.Enabled,
-		UserData:      lbp.UserData,
+		ID:               lbp.LogicalID,
+		FunctionName:     lbp.FunctionName,
+		File:             lbp.File,
+		Line:             lbp.Line,
+		Name:             lbp.Name,
+		Tracepoint:       lbp.Tracepoint,
+		TraceReturn:      lbp.TraceReturn,
+		Stacktrace:       lbp.Stacktrace,
+		Goroutine:        lbp.Goroutine,
+		Variables:        lbp.Variables,
+		LoadArgs:         LoadConfigFromProc(lbp.LoadArgs),
+		LoadLocals:       LoadConfigFromProc(lbp.LoadLocals),
+		TotalHitCount:    lbp.TotalHitCount,
+		Disabled:         !lbp.Enabled(),
+		UserData:         lbp.UserData,
+		RootFuncName:     lbp.RootFuncName,
+		TraceFollowCalls: lbp.TraceFollowCalls,
 	}
 
 	b.HitCount = map[string]uint64{}
@@ -41,14 +40,10 @@ func ConvertLogicalBreakpoint(lbp *proc.LogicalBreakpoint) *Breakpoint {
 		b.HitCount[strconv.FormatInt(idx, 10)] = lbp.HitCount[idx]
 	}
 
-	if lbp.HitCond != nil {
-		b.HitCond = fmt.Sprintf("%s %d", lbp.HitCond.Op.String(), lbp.HitCond.Val)
-		b.HitCondPerG = lbp.HitCondPerG
-	}
+	b.HitCond = lbp.HitCond()
+	b.HitCondPerG = lbp.HitCondPerG
 
-	var buf bytes.Buffer
-	printer.Fprint(&buf, token.NewFileSet(), lbp.Cond)
-	b.Cond = buf.String()
+	b.Cond = lbp.Cond()
 
 	return b
 }
@@ -102,7 +97,7 @@ func ConvertThread(th proc.Thread, bp *Breakpoint) *Thread {
 		gid      int64
 	)
 
-	loc, err := th.Location()
+	loc, err := proc.ThreadLocation(th)
 	if err == nil {
 		pc = loc.PC
 		file = loc.File
@@ -427,7 +422,6 @@ func ConvertRegisters(in *op.DwarfRegisters, dwarfRegisterToString func(int, *op
 			return a.DwarfNumber < b.DwarfNumber
 		}
 		return an < bn
-
 	})
 	return
 }

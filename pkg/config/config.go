@@ -9,7 +9,7 @@ import (
 	"runtime"
 
 	"github.com/go-delve/delve/service/api"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -76,8 +76,17 @@ type Config struct {
 	// Source list comment color, as a terminal escape sequence.
 	SourceListCommentColor string `yaml:"source-list-comment-color"`
 
+	// Color for the prompt line.
+	PromptColor string `yaml:"prompt-color"`
+
 	// Source list tab color, as a terminal escape sequence.
 	SourceListTabColor string `yaml:"source-list-tab-color"`
+
+	// Color for function names in the stack trace.
+	StackTraceFunctionColor string `yaml:"stacktrace-function-color"`
+
+	// Color for the base name in paths in the stack trace.
+	StackTraceBasenameColor string `yaml:"stacktrace-basename-color"`
 
 	// number of lines to list above and below cursor when printfile() is
 	// called (i.e. when execution stops, listCommand is used, etc)

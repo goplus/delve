@@ -12,7 +12,14 @@ import (
 	"syscall"
 
 	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
+)
+
+const (
+	delveRecordFlagsEnvVar = "DELVE_RR_RECORD_FLAGS"
+	delveReplayFlagsEnvVar = "DELVE_RR_REPLAY_FLAGS"
 )
 
 // RecordAsync configures rr to record the execution of the specified
@@ -31,6 +38,7 @@ func RecordAsync(cmd []string, wd string, quiet bool, stdin string, stdout proc.
 
 	args := make([]string, 0, len(cmd)+2)
 	args = append(args, "record", "--print-trace-dir=3")
+	args = append(args, config.SplitQuotedFields(os.Getenv(delveRecordFlagsEnvVar), '"')...)
 	args = append(args, cmd...)
 	rrcmd := exec.Command("rr", args...)
 	var closefn func()
@@ -134,6 +142,8 @@ func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string,
 		return nil, err
 	}
 
+	rrVersion := getRRVersion()
+
 	args := []string{
 		"replay",
 		"--dbgport=0",
@@ -141,6 +151,7 @@ func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string,
 	if rrOnProcessPid != 0 {
 		args = append(args, fmt.Sprintf("--onprocess=%d", rrOnProcessPid))
 	}
+	args = append(args, config.SplitQuotedFields(os.Getenv(delveReplayFlagsEnvVar), '\'')...)
 	args = append(args, tracedir)
 
 	rrcmd := exec.Command("rr", args...)
@@ -168,6 +179,7 @@ func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string,
 	p := newProcess(rrcmd.Process)
 	p.tracedir = tracedir
 	p.conn.useXcmd = true // 'rr' does not support the 'M' command which is what we would usually use to write memory, this is only important during function calls, in any other situation writing memory will fail anyway.
+	p.conn.newRRCmdStyle = rrVersion.AfterOrEqual(goversion.GoVersion{Major: 5, Minor: 8, Rev: 0})
 	if deleteOnDetach {
 		p.onDetach = func() {
 			safeRemoveAll(p.tracedir)
@@ -216,9 +228,11 @@ type rrInit struct {
 }
 
 const (
-	rrGdbCommandPrefix = "  gdb "
-	rrGdbLaunchPrefix  = "Launch gdb with"
-	targetCmd          = "target extended-remote "
+	rrGdbCommandLegacyPrefix = "  gdb "
+	rrGdbCommandPrefix       = "  'gdb' "
+	rrGdbLaunchLegacyPrefix  = "Launch gdb with"
+	rrGdbLaunchPrefix        = "Launch debugger with"
+	targetCmd                = "target extended-remote "
 )
 
 func rrStderrParser(stderr io.ReadCloser, initch chan<- rrInit, quiet bool) {
@@ -233,18 +247,23 @@ func rrStderrParser(stderr io.ReadCloser, initch chan<- rrInit, quiet bool) {
 			return
 		}
 
-		if strings.HasPrefix(line, rrGdbCommandPrefix) {
-			initch <- rrParseGdbCommand(line[len(rrGdbCommandPrefix):])
+		var flags string
+		var foundPrefix bool
+		if flags, foundPrefix = strings.CutPrefix(line, rrGdbCommandPrefix); !foundPrefix {
+			flags, foundPrefix = strings.CutPrefix(line, rrGdbCommandLegacyPrefix)
+		}
+		if foundPrefix {
+			initch <- rrParseGdbCommand(flags)
 			close(initch)
 			break
 		}
 
-		if strings.HasPrefix(line, rrGdbLaunchPrefix) {
+		if strings.HasPrefix(line, rrGdbLaunchPrefix) || strings.HasPrefix(line, rrGdbLaunchLegacyPrefix) {
 			continue
 		}
 
 		if !quiet {
-			os.Stderr.Write([]byte(line))
+			os.Stderr.WriteString(line)
 		}
 	}
 
@@ -320,4 +339,31 @@ func safeRemoveAll(dir string) {
 		}
 	}
 	os.Remove(dir)
+}
+
+func getRRVersion() goversion.GoVersion {
+	const rrVersionStringPrefix = "rr version "
+	buf, err := exec.Command("rr", "--version").CombinedOutput()
+	if err != nil {
+		return goversion.GoVersion{}
+	}
+	rest, ok := strings.CutPrefix(string(buf), rrVersionStringPrefix)
+	if !ok {
+		logflags.GdbWireLogger().Errorf("error reading rr version, prefix not found in %q", string(buf))
+		return goversion.GoVersion{}
+	}
+	rest = strings.TrimSpace(rest)
+	v := strings.Split(rest, ".")
+	if len(v) < 3 {
+		logflags.GdbWireLogger().Errorf("error reading rr version, not long enough %q", string(buf))
+		return goversion.GoVersion{}
+	}
+	major, majorerr := strconv.Atoi(v[0])
+	minor, minorerr := strconv.Atoi(v[1])
+	patch, patcherr := strconv.Atoi(v[2])
+	if majorerr != nil || minorerr != nil || patcherr != nil {
+		logflags.GdbWireLogger().Errorf("error reading rr version %v %v %v", majorerr, minorerr, patcherr)
+		return goversion.GoVersion{}
+	}
+	return goversion.GoVersion{Major: major, Minor: minor, Rev: patch}
 }

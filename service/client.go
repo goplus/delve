@@ -53,9 +53,9 @@ type Client interface {
 	Call(goroutineID int64, expr string, unsafe bool) (*api.DebuggerState, error)
 
 	// StepInstruction will step a single cpu instruction.
-	StepInstruction() (*api.DebuggerState, error)
+	StepInstruction(skipCalls bool) (*api.DebuggerState, error)
 	// ReverseStepInstruction will reverse step a single cpu instruction.
-	ReverseStepInstruction() (*api.DebuggerState, error)
+	ReverseStepInstruction(skipCalls bool) (*api.DebuggerState, error)
 	// SwitchThread switches the current thread context.
 	SwitchThread(threadID int) (*api.DebuggerState, error)
 	// SwitchGoroutine switches the current goroutine (and the current thread as well)
@@ -105,7 +105,7 @@ type Client interface {
 	// ListSources lists all source files in the process matching filter.
 	ListSources(filter string) ([]string, error)
 	// ListFunctions lists all functions in the process matching filter.
-	ListFunctions(filter string) ([]string, error)
+	ListFunctions(filter string, tracefollow int) ([]string, error)
 	// ListTypes lists all types in the process matching filter.
 	ListTypes(filter string) ([]string, error)
 	// ListPackagesBuildInfo lists all packages in the process matching filter.
@@ -204,6 +204,9 @@ type Client interface {
 
 	// GetDebugInfoDirectories returns the list of directories used to search for debug symbols
 	GetDebugInfoDirectories() ([]string, error)
+
+	// GuessSubstitutePath tries to guess a substitute-path configuration for the client
+	GuessSubstitutePath() ([][2]string, error)
 
 	// CallAPI allows calling an arbitrary rpc method (used by starlark bindings)
 	CallAPI(method string, args, reply interface{}) error

@@ -3,7 +3,10 @@ package proc
 import (
 	"bytes"
 	"fmt"
+	"go/parser"
+	"go/token"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/go-delve/delve/pkg/logflags"
@@ -68,6 +71,7 @@ func NewGroup(procgrp ProcessGroup, cfg NewTargetGroupConfig) (*TargetGroup, Add
 // Breakpoints that can not be set will be discarded, if discard is not nil
 // it will be called for each discarded breakpoint.
 func Restart(grp, oldgrp *TargetGroup, discard func(*LogicalBreakpoint, error)) {
+	toenable := []*LogicalBreakpoint{}
 	for _, bp := range oldgrp.LogicalBreakpoints {
 		if _, ok := grp.LogicalBreakpoints[bp.LogicalID]; ok {
 			continue
@@ -76,14 +80,18 @@ func Restart(grp, oldgrp *TargetGroup, discard func(*LogicalBreakpoint, error)) 
 		bp.TotalHitCount = 0
 		bp.HitCount = make(map[int64]uint64)
 		bp.Set.PidAddrs = nil // breakpoints set through a list of addresses can not be restored after a restart
-		if bp.Enabled {
-			err := grp.EnableBreakpoint(bp)
-			if err != nil {
-				if discard != nil {
-					discard(bp, err)
-				}
-				delete(grp.LogicalBreakpoints, bp.LogicalID)
+		if bp.enabled {
+			toenable = append(toenable, bp)
+		}
+	}
+	for _, bp := range toenable {
+		bp.condSatisfiable = breakpointConditionSatisfiable(grp.LogicalBreakpoints, bp)
+		err := grp.enableBreakpoint(bp)
+		if err != nil {
+			if discard != nil {
+				discard(bp, err)
 			}
+			delete(grp.LogicalBreakpoints, bp.LogicalID)
 		}
 	}
 	if oldgrp.followExecEnabled {
@@ -189,7 +197,7 @@ func (grp *TargetGroup) Detach(kill bool) error {
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "\n"))
 	}
-	return nil
+	return grp.procgrp.Close()
 }
 
 // detachTarget will detach the target from the underlying process.
@@ -253,8 +261,22 @@ func (grp *TargetGroup) TargetForThread(tid int) *Target {
 	return nil
 }
 
-// EnableBreakpoint re-enables a disabled logical breakpoint.
-func (grp *TargetGroup) EnableBreakpoint(lbp *LogicalBreakpoint) error {
+// SetBreakpointEnabled either enables or disabled the specified breakpoint based on the value of enabled.
+func (grp *TargetGroup) SetBreakpointEnabled(lbp *LogicalBreakpoint, enabled bool) (err error) {
+	switch {
+	case lbp.enabled && !enabled:
+		lbp.enabled = false
+		err = grp.disableBreakpoint(lbp)
+	case !lbp.enabled && enabled:
+		lbp.enabled = true
+		lbp.condSatisfiable = breakpointConditionSatisfiable(grp.LogicalBreakpoints, lbp)
+		err = grp.enableBreakpoint(lbp)
+	}
+	return
+}
+
+// enableBreakpoint re-enables a disabled logical breakpoint.
+func (grp *TargetGroup) enableBreakpoint(lbp *LogicalBreakpoint) error {
 	var err0, errNotFound, errExists error
 	didSet := false
 targetLoop:
@@ -297,11 +319,13 @@ targetLoop:
 		}
 		return err0
 	}
-	lbp.Enabled = true
 	return nil
 }
 
 func enableBreakpointOnTarget(p *Target, lbp *LogicalBreakpoint) error {
+	if !lbp.enabled || !lbp.condSatisfiable {
+		return nil
+	}
 	var err error
 	var addrs []uint64
 	switch {
@@ -338,8 +362,8 @@ func enableBreakpointOnTarget(p *Target, lbp *LogicalBreakpoint) error {
 	return err
 }
 
-// DisableBreakpoint disables a logical breakpoint.
-func (grp *TargetGroup) DisableBreakpoint(lbp *LogicalBreakpoint) error {
+// disableBreakpoint disables a logical breakpoint.
+func (grp *TargetGroup) disableBreakpoint(lbp *LogicalBreakpoint) error {
 	var errs []error
 	n := 0
 	it := ValidTargets{Group: grp}
@@ -368,7 +392,118 @@ func (grp *TargetGroup) DisableBreakpoint(lbp *LogicalBreakpoint) error {
 		}
 		return fmt.Errorf("unable to clear breakpoint %d (partial): %s", lbp.LogicalID, buf.String())
 	}
-	lbp.Enabled = false
+	return nil
+}
+
+// ChangeBreakpointCondition changes the breakpoint condition of lbp.
+func (grp *TargetGroup) ChangeBreakpointCondition(lbp *LogicalBreakpoint, cond, hitCond string, hitCondPerG bool) error {
+	lbp.cond = nil
+	if cond != "" {
+		var err error
+		lbp.cond, err = parser.ParseExpr(cond)
+		if err != nil {
+			return err
+		}
+	}
+
+	t := ValidTargets{Group: grp}
+	for t.Next() {
+		for _, bp := range t.Breakpoints().M {
+			if bp.LogicalID() == lbp.LogicalID {
+				bp.UserBreaklet().Cond = lbp.cond
+			}
+		}
+	}
+
+	lbp.hitCond = nil
+	if hitCond != "" {
+		opTok, val, err := parseHitCondition(hitCond)
+		if err != nil {
+			return err
+		}
+		lbp.hitCond = &struct {
+			Op  token.Token
+			Val int
+		}{opTok, val}
+		lbp.HitCondPerG = hitCondPerG
+	}
+
+	lbp.condUsesHitCounts = breakpointConditionUsesHitCounts(lbp)
+
+	if lbp.enabled {
+		switch {
+		case lbp.condSatisfiable && !breakpointConditionSatisfiable(grp.LogicalBreakpoints, lbp):
+			lbp.condSatisfiable = false
+			grp.disableBreakpoint(lbp)
+		case !lbp.condSatisfiable && breakpointConditionSatisfiable(grp.LogicalBreakpoints, lbp):
+			lbp.condSatisfiable = true
+			grp.enableBreakpoint(lbp)
+		}
+	}
+
+	return nil
+}
+
+func parseHitCondition(hitCond string) (token.Token, int, error) {
+	// A hit condition can be in the following formats:
+	// - "number"
+	// - "OP number"
+	hitConditionRegex := regexp.MustCompile(`(([=><%!])+|)( |)((\d|_)+)`)
+
+	match := hitConditionRegex.FindStringSubmatch(strings.TrimSpace(hitCond))
+	if match == nil || len(match) != 6 {
+		return 0, 0, fmt.Errorf("unable to parse breakpoint hit condition: %q\nhit conditions should be of the form \"number\" or \"OP number\"", hitCond)
+	}
+
+	opStr := match[1]
+	var opTok token.Token
+	switch opStr {
+	case "==", "":
+		opTok = token.EQL
+	case ">=":
+		opTok = token.GEQ
+	case "<=":
+		opTok = token.LEQ
+	case ">":
+		opTok = token.GTR
+	case "<":
+		opTok = token.LSS
+	case "%":
+		opTok = token.REM
+	case "!=":
+		opTok = token.NEQ
+	default:
+		return 0, 0, fmt.Errorf("unable to parse breakpoint hit condition: %q\ninvalid operator: %q", hitCond, opStr)
+	}
+
+	numStr := match[4]
+	val, parseErr := strconv.Atoi(numStr)
+	if parseErr != nil {
+		return 0, 0, fmt.Errorf("unable to parse breakpoint hit condition: %q\ninvalid number: %q", hitCond, numStr)
+	}
+
+	return opTok, val, nil
+}
+
+// manageUnsatisfiableBreakpoints automatically disables breakpoints with unsatisifiable hit conditions.
+func (grp *TargetGroup) manageUnsatisfiableBreakpoints() error {
+	for _, lbp := range grp.LogicalBreakpoints {
+		if lbp.enabled {
+			if lbp.condSatisfiable && !breakpointConditionSatisfiable(grp.LogicalBreakpoints, lbp) {
+				lbp.condSatisfiable = false
+				err := grp.disableBreakpoint(lbp)
+				if err != nil {
+					return err
+				}
+			} else if lbp.condUsesHitCounts && !lbp.condSatisfiable && breakpointConditionSatisfiable(grp.LogicalBreakpoints, lbp) {
+				lbp.condSatisfiable = true
+				err := grp.enableBreakpoint(lbp)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
