@@ -60,7 +60,7 @@ func (drs *DebugRegisters) breakpoint(idx uint8) (addr uint64, read, write bool,
 // nothing.
 func (drs *DebugRegisters) SetBreakpoint(idx uint8, addr uint64, read, write bool, sz int) error {
 	if int(idx) >= len(drs.pAddrs) {
-		return fmt.Errorf("hardware breakpoints exhausted")
+		return errors.New("hardware breakpoints exhausted")
 	}
 	curaddr, curread, curwrite, cursz := drs.breakpoint(idx)
 	if curaddr != 0 {
@@ -115,7 +115,7 @@ func (drs *DebugRegisters) ClearBreakpoint(idx uint8) {
 // GetActiveBreakpoint returns the active hardware breakpoint and resets the
 // condition flags.
 func (drs *DebugRegisters) GetActiveBreakpoint() (ok bool, idx uint8) {
-	for idx := uint8(0); idx < 3; idx++ {
+	for idx := uint8(0); idx <= 3; idx++ {
 		enable := *(drs.pDR7) & (1 << enableBitOffset(idx))
 		if enable == 0 {
 			continue

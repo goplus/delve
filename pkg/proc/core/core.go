@@ -168,14 +168,14 @@ type process struct {
 
 // thread represents a thread in the core file being debugged.
 type thread struct {
-	th     osThread
+	osThread
 	p      *process
 	common proc.CommonThread
 }
 
 type osThread interface {
-	registers() (proc.Registers, error)
-	pid() int
+	Registers() (proc.Registers, error)
+	ThreadID() int
 }
 
 var (
@@ -319,33 +319,11 @@ func (t *thread) ProcessMemory() proc.MemoryReadWriter {
 	return t.p
 }
 
-// Location returns the location of this thread based on
-// the value of the instruction pointer register.
-func (t *thread) Location() (*proc.Location, error) {
-	regs, err := t.th.registers()
-	if err != nil {
-		return nil, err
-	}
-	pc := regs.PC()
-	f, l, fn := t.p.bi.PCToLine(pc)
-	return &proc.Location{PC: pc, File: f, Line: l, Fn: fn}, nil
-}
-
 // Breakpoint returns the current breakpoint this thread is stopped at.
 // For core files this always returns an empty BreakpointState struct, as
 // there are no breakpoints when debugging core files.
 func (t *thread) Breakpoint() *proc.BreakpointState {
 	return &proc.BreakpointState{}
-}
-
-// ThreadID returns the ID for this thread.
-func (t *thread) ThreadID() int {
-	return t.th.pid()
-}
-
-// Registers returns the current value of the registers for this thread.
-func (t *thread) Registers() (proc.Registers, error) {
-	return t.th.registers()
 }
 
 // RestoreRegisters will only return an error for core files,
@@ -449,6 +427,10 @@ func (p *process) Memory() proc.MemoryReadWriter {
 // effect as you cannot detach from a core file
 // and have it continue execution or exit.
 func (p *process) Detach(int, bool) error {
+	return nil
+}
+
+func (p *process) Close() error {
 	return nil
 }
 

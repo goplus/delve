@@ -8,6 +8,7 @@ import (
 	sys "golang.org/x/sys/unix"
 
 	"github.com/go-delve/delve/pkg/proc/amd64util"
+	"github.com/go-delve/delve/pkg/proc/native/cpuid"
 )
 
 // ptraceGetRegset returns floating point registers of the specified thread
@@ -22,7 +23,7 @@ func ptraceGetRegset(tid int) (regset amd64util.AMD64Xstate, err error) {
 		err = nil
 	}
 
-	xstateargs := make([]byte, amd64util.AMD64XstateMaxSize())
+	xstateargs := make([]byte, cpuid.AMD64XstateMaxSize())
 	iov := sys.Iovec{Base: &xstateargs[0], Len: uint32(len(xstateargs))}
 	_, _, err = syscall.Syscall6(syscall.SYS_PTRACE, sys.PTRACE_GETREGSET, uintptr(tid), _NT_X86_XSTATE, uintptr(unsafe.Pointer(&iov)), 0, 0)
 	if err != syscall.Errno(0) {
@@ -38,13 +39,13 @@ func ptraceGetRegset(tid int) (regset amd64util.AMD64Xstate, err error) {
 	}
 
 	regset.Xsave = xstateargs[:iov.Len]
-	err = amd64util.AMD64XstateRead(regset.Xsave, false, &regset)
+	err = amd64util.AMD64XstateRead(regset.Xsave, false, &regset, cpuid.AMD64XstateZMMHi256Offset())
 	return
 }
 
 // ptraceGetTls return the addr of tls by PTRACE_GET_THREAD_AREA for specify thread.
-// See http://man7.org/linux/man-pages/man2/ptrace.2.html for detail about PTRACE_GET_THREAD_AREA.
-// struct user_desc at https://golang.org/src/runtime/sys_linux_386.s
+// See https://man7.org/linux/man-pages/man2/ptrace.2.html for detail about PTRACE_GET_THREAD_AREA.
+// struct user_desc at https://go.dev/src/runtime/sys_linux_386.s
 //
 //	type UserDesc struct {
 //		 EntryNumber uint32

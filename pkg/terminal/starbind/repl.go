@@ -34,6 +34,7 @@ package starbind
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -116,7 +117,7 @@ func rep(rl *liner.State, thread *starlark.Thread, globals starlark.StringDict, 
 	if expr := soleExpr(f); expr != nil {
 		//TODO: check for 'exit'
 		// eval
-		v, err := starlark.EvalExpr(thread, expr, globals)
+		v, err := evalExprOptions(nil, thread, expr, globals)
 		if err != nil {
 			printError(err)
 			return nil
@@ -186,7 +187,7 @@ func MakeLoad() func(thread *starlark.Thread, module string) (starlark.StringDic
 		if e == nil {
 			if ok {
 				// request for package whose loading is in progress
-				return nil, fmt.Errorf("cycle in load graph")
+				return nil, errors.New("cycle in load graph")
 			}
 
 			// Add a placeholder to indicate "load in progress".
@@ -194,7 +195,7 @@ func MakeLoad() func(thread *starlark.Thread, module string) (starlark.StringDic
 
 			// Load it.
 			thread := &starlark.Thread{Name: "exec " + module, Load: thread.Load}
-			globals, err := starlark.ExecFile(thread, module, nil, nil)
+			globals, err := execFileOptions(nil, thread, module, nil, nil)
 			e = &entry{globals, err}
 
 			// Update the cache.

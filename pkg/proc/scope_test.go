@@ -1,6 +1,7 @@
 package proc_test
 
 import (
+	"errors"
 	"fmt"
 	"go/constant"
 	"go/parser"
@@ -80,12 +81,11 @@ func TestScope(t *testing.T) {
 		t.Logf("%d breakpoints set", len(scopeChecks))
 
 		for {
-			if err := grp.Continue(); err != nil {
-				if _, exited := err.(proc.ErrProcessExited); exited {
-					break
-				}
-				assertNoError(err, t, "Continue()")
+			err := grp.Continue()
+			if errors.As(err, &proc.ErrProcessExited{}) {
+				break
 			}
+			assertNoError(err, t, "Continue()")
 			bp := p.CurrentThread().Breakpoint()
 
 			scopeCheck := findScopeCheck(scopeChecks, bp.Line)
@@ -104,7 +104,7 @@ func TestScope(t *testing.T) {
 			}
 
 			scopeCheck.ok = true
-			err := p.ClearBreakpoint(bp.Addr)
+			err = p.ClearBreakpoint(bp.Addr)
 			assertNoError(err, t, "ClearBreakpoint")
 		}
 	})
@@ -114,7 +114,6 @@ func TestScope(t *testing.T) {
 			t.Errorf("breakpoint at line %d not hit", scopeChecks[i].line)
 		}
 	}
-
 }
 
 type scopeCheck struct {
@@ -288,7 +287,6 @@ func (varCheck *varCheck) checkInScope(line int, scope *proc.EvalScope, t *testi
 	v, err := scope.EvalExpression(varCheck.name, normalLoadConfig)
 	assertNoError(err, t, fmt.Sprintf("EvalVariable(%s)", varCheck.name))
 	varCheck.check(line, v, t, "EvalExpression")
-
 }
 
 func (varCheck *varCheck) check(line int, v *proc.Variable, t *testing.T, ctxt string) {

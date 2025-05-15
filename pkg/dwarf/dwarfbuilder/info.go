@@ -137,7 +137,7 @@ func (b *Builder) Attr(attr dwarf.Attr, val interface{}) dwarf.Offset {
 	switch x := val.(type) {
 	case string:
 		tag.form = append(tag.form, DW_FORM_string)
-		b.info.Write([]byte(x))
+		b.info.WriteString(x)
 		b.info.WriteByte(0)
 	case uint8:
 		tag.form = append(tag.form, DW_FORM_data1)
@@ -243,6 +243,8 @@ func (b *Builder) makeAbbrevTable() []byte {
 		leb128.EncodeUnsigned(&abbrev, 0)
 		leb128.EncodeUnsigned(&abbrev, 0)
 	}
+
+	leb128.EncodeUnsigned(&abbrev, uint64(0))
 
 	return abbrev.Bytes()
 }

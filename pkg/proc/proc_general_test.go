@@ -30,6 +30,26 @@ func TestIssue554(t *testing.T) {
 	}
 }
 
+func TestIssue3760(t *testing.T) {
+	// unsigned integer overflow if len(m.cache) < size
+	mem := memCache{true, 0x20, make([]byte, 100), nil}
+	if mem.contains(0x20, 200) {
+		t.Fatalf("should be false")
+	}
+	// test overflow of end addr
+	mem = memCache{true, 0xfffffffffffffff0, make([]byte, 15), nil}
+	if !mem.contains(0xfffffffffffffff0, 15) {
+		t.Fatalf("should contain it")
+	}
+	if mem.contains(0xfffffffffffffff0, 16) {
+		t.Fatalf("should be false")
+	}
+	cm := cacheMemory(nil, 0xffffffffffffffff, 1)
+	if cm != nil {
+		t.Fatalf("should be nil")
+	}
+}
+
 type dummyMem struct {
 	t     *testing.T
 	mem   []byte
@@ -110,13 +130,13 @@ func assertNoError(err error, t testing.TB, s string) {
 
 func TestDwarfVersion(t *testing.T) {
 	// Tests that we correctly read the version of compilation units
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	bi := NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
 	// Use a fake entry point so LoadBinaryInfo does not error in case the binary is PIE.
 	const fakeEntryPoint = 1
 	assertNoError(bi.LoadBinaryInfo(fixture.Path, fakeEntryPoint, nil), t, "LoadBinaryInfo")
 	for _, cu := range bi.Images[0].compileUnits {
-		if cu.Version != 4 {
+		if cu.Version != 4 && cu.Version != 5 {
 			t.Errorf("compile unit %q at %#x has bad version %d", cu.name, cu.entry.Offset, cu.Version)
 		}
 	}
@@ -127,7 +147,7 @@ func TestRegabiFlagSentinel(t *testing.T) {
 	if !protest.RegabiSupported() {
 		t.Skip("irrelevant before Go 1.17 or on non-amd64 architectures")
 	}
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	bi := NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
 	// Use a fake entry point so LoadBinaryInfo does not error in case the binary is PIE.
 	const fakeEntryPoint = 1

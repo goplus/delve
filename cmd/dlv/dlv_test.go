@@ -31,11 +31,6 @@ import (
 )
 
 var testBackend string
-var ldFlags string
-
-func init() {
-	ldFlags = os.Getenv("CGO_LDFLAGS")
-}
 
 func TestMain(m *testing.M) {
 	flag.StringVar(&testBackend, "backend", "", "selects backend")
@@ -49,7 +44,7 @@ func TestMain(m *testing.M) {
 			}
 		}
 	}
-	os.Exit(protest.RunTestsWithFixtures(m))
+	protest.RunTestsWithFixtures(m)
 }
 
 func assertNoError(err error, t testing.TB, s string) {
@@ -61,45 +56,16 @@ func assertNoError(err error, t testing.TB, s string) {
 	}
 }
 
-func projectRoot() string {
-	wd, err := os.Getwd()
-	if err != nil {
-		panic(err)
-	}
-
-	gopaths := strings.FieldsFunc(os.Getenv("GOPATH"), func(r rune) bool { return r == os.PathListSeparator })
-	for _, curpath := range gopaths {
-		// Detects "gopath mode" when GOPATH contains several paths ex. "d:\\dir\\gopath;f:\\dir\\gopath2"
-		if strings.Contains(wd, curpath) {
-			return filepath.Join(curpath, "src", "github.com", "go-delve", "delve")
-		}
-	}
-	val, err := exec.Command("go", "list", "-mod=", "-m", "-f", "{{ .Dir }}").Output()
-	if err != nil {
-		panic(err) // the Go tool was tested to work earlier
-	}
-	return strings.TrimSuffix(string(val), "\n")
-}
-
 func TestBuild(t *testing.T) {
 	const listenAddr = "127.0.0.1:40573"
-	var err error
 
-	cmd := exec.Command("go", "run", "_scripts/make.go", "build")
-	cmd.Dir = projectRoot()
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("makefile error: %v\noutput %s\n", err, string(out))
-	}
-
-	dlvbin := filepath.Join(cmd.Dir, "dlv")
-	defer os.Remove(dlvbin)
+	dlvbin := protest.GetDlvBinary(t)
 
 	fixtures := protest.FindFixturesDir()
 
 	buildtestdir := filepath.Join(fixtures, "buildtest")
 
-	cmd = exec.Command(dlvbin, "debug", "--headless=true", "--listen="+listenAddr, "--api-version=2", "--backend="+testBackend, "--log", "--log-output=debugger,rpc")
+	cmd := exec.Command(dlvbin, "debug", "--headless=true", "--listen="+listenAddr, "--api-version=2", "--backend="+testBackend, "--log", "--log-output=debugger,rpc")
 	cmd.Dir = buildtestdir
 	stderr, err := cmd.StderrPipe()
 	assertNoError(err, t, "stderr pipe")
@@ -202,43 +168,10 @@ func testOutput(t *testing.T, dlvbin, output string, delveCmds []string) (stdout
 	return
 }
 
-func getDlvBin(t *testing.T) string {
-	// In case this was set in the environment
-	// from getDlvBinEBPF lets clear it here, so
-	// we can ensure we don't get build errors
-	// depending on the test ordering.
-	t.Setenv("CGO_LDFLAGS", ldFlags)
-	var tags string
-	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-		tags = "-tags=exp.winarm64"
-	}
-	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
-		tags = "-tags=exp.linuxppc64le"
-	}
-	return getDlvBinInternal(t, tags)
-}
-
-func getDlvBinEBPF(t *testing.T) string {
-	return getDlvBinInternal(t, "-tags", "ebpf")
-}
-
-func getDlvBinInternal(t *testing.T, goflags ...string) string {
-	dlvbin := filepath.Join(t.TempDir(), "dlv.exe")
-	args := append([]string{"build", "-o", dlvbin}, goflags...)
-	args = append(args, "github.com/go-delve/delve/cmd/dlv")
-
-	out, err := exec.Command("go", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("go build -o %v github.com/go-delve/delve/cmd/dlv: %v\n%s", dlvbin, err, string(out))
-	}
-
-	return dlvbin
-}
-
 // TestOutput verifies that the debug executable is created in the correct path
 // and removed after exit.
 func TestOutput(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	for _, output := range []string{"__debug_bin", "myownname", filepath.Join(t.TempDir(), "absolute.path")} {
 		testOutput(t, dlvbin, output, []string{"exit"})
@@ -251,11 +184,40 @@ func TestOutput(t *testing.T) {
 	}
 }
 
+// TestUnattendedBreakpoint tests whether dlv will print a message to stderr when the client that sends continue is disconnected
+// or not.
+func TestUnattendedBreakpoint(t *testing.T) {
+	const listenAddr = "127.0.0.1:40573"
+
+	fixturePath := filepath.Join(protest.FindFixturesDir(), "panic.go")
+	cmd := exec.Command(protest.GetDlvBinary(t), "debug", "--continue", "--headless", "--accept-multiclient", "--listen", listenAddr, fixturePath)
+	stderr, err := cmd.StderrPipe()
+	assertNoError(err, t, "stdout pipe")
+	defer stderr.Close()
+
+	assertNoError(cmd.Start(), t, "start headless instance")
+
+	scan := bufio.NewScanner(stderr)
+	for scan.Scan() {
+		t.Log(scan.Text())
+		if strings.Contains(scan.Text(), "execution is paused because your program is panicking") {
+			break
+		}
+	}
+
+	// and detach from and kill the headless instance
+	client := rpc2.NewClient(listenAddr)
+	if err := client.Detach(true); err != nil {
+		t.Fatalf("error detaching from headless instance: %v", err)
+	}
+	cmd.Wait()
+}
+
 // TestContinue verifies that the debugged executable starts immediately with --continue
 func TestContinue(t *testing.T) {
 	const listenAddr = "127.0.0.1:40573"
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	buildtestdir := filepath.Join(protest.FindFixturesDir(), "buildtest")
 	cmd := exec.Command(dlvbin, "debug", "--headless", "--continue", "--accept-multiclient", "--listen", listenAddr)
@@ -287,7 +249,7 @@ func TestContinue(t *testing.T) {
 func TestRedirect(t *testing.T) {
 	const listenAddr = "127.0.0.1:40573"
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	catfixture := filepath.Join(protest.FindFixturesDir(), "cat.go")
 	cmd := exec.Command(dlvbin, "debug", "--headless", "--continue", "--accept-multiclient", "--listen", listenAddr, "-r", catfixture, catfixture)
@@ -315,7 +277,7 @@ func TestRedirect(t *testing.T) {
 const checkAutogenDocLongOutput = false
 
 func checkAutogenDoc(t *testing.T, filename, gencommand string, generated []byte) {
-	saved := slurpFile(t, filepath.Join(projectRoot(), filename))
+	saved := slurpFile(t, filepath.Join(protest.ProjectRoot(), filename))
 
 	saved = bytes.ReplaceAll(saved, []byte("\r\n"), []byte{'\n'})
 	generated = bytes.ReplaceAll(generated, []byte("\r\n"), []byte{'\n'})
@@ -353,7 +315,7 @@ func diffMaybe(t *testing.T, filename string, generated []byte) {
 		return
 	}
 	cmd := exec.Command("diff", filename, "-")
-	cmd.Dir = projectRoot()
+	cmd.Dir = protest.ProjectRoot()
 	stdin, _ := cmd.StdinPipe()
 	go func() {
 		stdin.Write(generated)
@@ -374,6 +336,9 @@ func TestGeneratedDoc(t *testing.T) {
 		//TODO(alexsaezm): finish CI integration
 		t.Skip("skipping test on Linux/PPC64LE in CI")
 	}
+	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 24) {
+		t.Skip("disabled due to export format changes")
+	}
 	// Checks gen-cli-docs.go
 	var generatedBuf bytes.Buffer
 	commands := terminal.DebugCommands(nil)
@@ -383,7 +348,7 @@ func TestGeneratedDoc(t *testing.T) {
 	// Checks gen-usage-docs.go
 	tempDir := t.TempDir()
 	cmd := exec.Command("go", "run", "_scripts/gen-usage-docs.go", tempDir)
-	cmd.Dir = projectRoot()
+	cmd.Dir = protest.ProjectRoot()
 	err := cmd.Run()
 	assertNoError(err, t, "go run _scripts/gen-usage-docs.go")
 	entries, err := os.ReadDir(tempDir)
@@ -397,7 +362,7 @@ func TestGeneratedDoc(t *testing.T) {
 		a := []string{"run"}
 		a = append(a, args...)
 		cmd := exec.Command("go", a...)
-		cmd.Dir = projectRoot()
+		cmd.Dir = protest.ProjectRoot()
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("could not run script %v: %v (output: %q)", args, err, string(out))
@@ -409,6 +374,7 @@ func TestGeneratedDoc(t *testing.T) {
 	checkAutogenDoc(t, "pkg/terminal/starbind/starlark_mapping.go", "'go generate' inside pkg/terminal/starbind", runScript("_scripts/gen-starlark-bindings.go", "go", "-"))
 	checkAutogenDoc(t, "Documentation/cli/starlark.md", "'go generate' inside pkg/terminal/starbind", runScript("_scripts/gen-starlark-bindings.go", "doc/dummy", "Documentation/cli/starlark.md"))
 	checkAutogenDoc(t, "Documentation/faq.md", "'go run _scripts/gen-faq-toc.go Documentation/faq.md Documentation/faq.md'", runScript("_scripts/gen-faq-toc.go", "Documentation/faq.md", "-"))
+	checkAutogenDoc(t, "service/rpccommon/suitablemethods.go", "'go generate' inside service/rpccommon", runScript("_scripts/gen-suitablemethods.go", "-"))
 	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 18) {
 		checkAutogenDoc(t, "_scripts/rtype-out.txt", "go run _scripts/rtype.go report _scripts/rtype-out.txt", runScript("_scripts/rtype.go", "report"))
 		runScript("_scripts/rtype.go", "check")
@@ -416,7 +382,7 @@ func TestGeneratedDoc(t *testing.T) {
 }
 
 func TestExitInInit(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	buildtestdir := filepath.Join(protest.FindFixturesDir(), "buildtest")
 	exitInit := filepath.Join(protest.FindFixturesDir(), "exit.init")
@@ -501,6 +467,9 @@ func qf(*types.Package) string {
 }
 
 func TestTypecheckRPC(t *testing.T) {
+	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 24) {
+		t.Skip("disabled due to export format changes")
+	}
 	fset := &token.FileSet{}
 	cfg := &packages.Config{
 		Mode: packages.NeedSyntax | packages.NeedTypesInfo | packages.NeedName | packages.NeedCompiledGoFiles | packages.NeedTypes,
@@ -616,7 +585,7 @@ func TestTypecheckRPC(t *testing.T) {
 func TestDAPCmd(t *testing.T) {
 	const listenAddr = "127.0.0.1:40575"
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	cmd := exec.Command(dlvbin, "dap", "--log-output=dap", "--log", "--listen", listenAddr)
 	stdout, err := cmd.StdoutPipe()
@@ -679,7 +648,7 @@ func newDAPRemoteClient(t *testing.T, addr string, isDlvAttach bool, isMulti boo
 func TestRemoteDAPClient(t *testing.T) {
 	const listenAddr = "127.0.0.1:40576"
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	buildtestdir := filepath.Join(protest.FindFixturesDir(), "buildtest")
 	cmd := exec.Command(dlvbin, "debug", "--headless", "--log-output=dap", "--log", "--listen", listenAddr)
@@ -732,7 +701,7 @@ func closeDAPRemoteMultiClient(t *testing.T, c *daptest.Client, expectStatus str
 func TestRemoteDAPClientMulti(t *testing.T) {
 	const listenAddr = "127.0.0.1:40577"
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	buildtestdir := filepath.Join(protest.FindFixturesDir(), "buildtest")
 	cmd := exec.Command(dlvbin, "debug", "--headless", "--accept-multiclient", "--log-output=debugger", "--log", "--listen", listenAddr)
@@ -799,9 +768,9 @@ func TestRemoteDAPClientMulti(t *testing.T) {
 func TestRemoteDAPClientAfterContinue(t *testing.T) {
 	const listenAddr = "127.0.0.1:40578"
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
-	fixture := protest.BuildFixture("loopprog", 0)
+	fixture := protest.BuildFixture(t, "loopprog", 0)
 	cmd := exec.Command(dlvbin, "exec", fixture.Path, "--headless", "--continue", "--accept-multiclient", "--log-output=debugger,dap", "--log", "--listen", listenAddr)
 	stdout, err := cmd.StdoutPipe()
 	assertNoError(err, t, "stdout pipe")
@@ -860,7 +829,7 @@ func TestDAPCmdWithClient(t *testing.T) {
 	}
 	defer listener.Close()
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	cmd := exec.Command(dlvbin, "dap", "--log-output=dap", "--log", "--client-addr", listener.Addr().String())
 	buf := &bytes.Buffer{}
@@ -893,10 +862,57 @@ func TestDAPCmdWithClient(t *testing.T) {
 	}
 }
 
-func TestTrace(t *testing.T) {
-	dlvbin := getDlvBin(t)
+// TestDAPCmdWithUnixClient tests dlv dap --client-addr can be started with unix domain socket and shut down.
+func TestDAPCmdWithUnixClient(t *testing.T) {
+	tmpdir := os.TempDir()
+	if tmpdir == "" {
+		return
+	}
 
-	expected := []byte("> goroutine(1): main.foo(99, 9801)\n>> goroutine(1): => (9900)\n")
+	listenPath := filepath.Join(tmpdir, "dap_test")
+	listener, err := net.Listen("unix", listenPath)
+	if err != nil {
+		t.Fatalf("cannot setup listener required for testing: %v", err)
+	}
+	defer listener.Close()
+
+	dlvbin := protest.GetDlvBinary(t)
+
+	cmd := exec.Command(dlvbin, "dap", "--log-output=dap", "--log", "--client-addr=unix:"+listener.Addr().String())
+	buf := &bytes.Buffer{}
+	cmd.Stdin = buf
+	cmd.Stdout = buf
+	assertNoError(cmd.Start(), t, "start dlv dap process with --client-addr flag")
+
+	// Wait for the connection.
+	conn, err := listener.Accept()
+	if err != nil {
+		cmd.Process.Kill() // release the socket file
+		t.Fatalf("Failed to get connection: %v", err)
+	}
+	t.Log("dlv dap process dialed in successfully")
+
+	client := daptest.NewClientFromConn(conn)
+	client.InitializeRequest()
+	client.ExpectInitializeResponse(t)
+
+	// Close the connection.
+	if err := conn.Close(); err != nil {
+		cmd.Process.Kill()
+		t.Fatalf("Failed to get connection: %v", err)
+	}
+
+	// Connection close should trigger dlv-reverse command's normal exit.
+	if err := cmd.Wait(); err != nil {
+		cmd.Process.Kill()
+		t.Fatalf("command failed: %v\n%s\n%v", err, buf.Bytes(), cmd.Process.Pid)
+	}
+}
+
+func TestTrace(t *testing.T) {
+	dlvbin := protest.GetDlvBinary(t)
+
+	expected := []byte("> goroutine(1): main.foo(99, 9801)\n>> goroutine(1): main.foo => (9900)\n")
 
 	fixtures := protest.FindFixturesDir()
 	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "issue573.go"), "foo")
@@ -918,9 +934,9 @@ func TestTrace(t *testing.T) {
 }
 
 func TestTrace2(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
-	expected := []byte("> goroutine(1): main.callme(2)\n>> goroutine(1): => (4)\n")
+	expected := []byte("> goroutine(1): main.callme(2)\n>> goroutine(1): main.callme => (4)\n")
 
 	fixtures := protest.FindFixturesDir()
 	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "traceprog.go"), "callme")
@@ -941,14 +957,47 @@ func TestTrace2(t *testing.T) {
 	assertNoError(cmd.Wait(), t, "cmd.Wait()")
 }
 
+func TestTraceDirRecursion(t *testing.T) {
+	dlvbin := protest.GetDlvBinary(t)
+
+	expected := []byte("> goroutine(1):frame(1) main.A(5, 5)\n > goroutine(1):frame(2) main.A(4, 4)\n  > goroutine(1):frame(3) main.A(3, 3)\n   > goroutine(1):frame(4) main.A(2, 2)\n    > goroutine(1):frame(5) main.A(1, 1)\n    >> goroutine(1):frame(5) main.A => (1)\n   >> goroutine(1):frame(4) main.A => (2)\n  >> goroutine(1):frame(3) main.A => (6)\n >> goroutine(1):frame(2) main.A => (24)\n>> goroutine(1):frame(1) main.A => (120)\n")
+
+	fixtures := protest.FindFixturesDir()
+	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "leafrec.go"), "main.A", "--follow-calls", "4")
+	rdr, err := cmd.StderrPipe()
+	assertNoError(err, t, "stderr pipe")
+	defer rdr.Close()
+
+	cmd.Dir = filepath.Join(fixtures, "buildtest")
+
+	assertNoError(cmd.Start(), t, "running trace")
+	// Parse output to ignore calls to morestack_noctxt for comparison
+	scan := bufio.NewScanner(rdr)
+	text := ""
+	outputtext := ""
+	for scan.Scan() {
+		text = scan.Text()
+		if !strings.Contains(text, "morestack_noctxt") {
+			outputtext += text
+			outputtext += "\n"
+		}
+	}
+	output := []byte(outputtext)
+
+	if !bytes.Contains(output, expected) {
+		t.Fatalf("expected:\n%s\ngot:\n%s", string(expected), string(output))
+	}
+	assertNoError(cmd.Wait(), t, "cmd.Wait()")
+}
+
 func TestTraceMultipleGoroutines(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	// TODO(derekparker) this test has to be a bit vague to avoid flakiness.
 	// I think a future improvement could be to use regexp captures to match the
 	// goroutine IDs at function entry and exit.
 	expected := []byte("main.callme(0, \"five\")\n")
-	expected2 := []byte("=> (0)\n")
+	expected2 := []byte("main.callme => (0)\n")
 
 	fixtures := protest.FindFixturesDir()
 	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "goroutines-trace.go"), "callme")
@@ -981,12 +1030,12 @@ func TestTracePid(t *testing.T) {
 		}
 	}
 
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
-	expected := []byte("goroutine(1): main.A()\n>> goroutine(1): => ()\n")
+	expected := []byte("goroutine(1): main.A()\n>> goroutine(1): main.A => ()\n")
 
 	// make process run
-	fix := protest.BuildFixture("issue2023", 0)
+	fix := protest.BuildFixture(t, "issue2023", 0)
 	targetCmd := exec.Command(fix.Path)
 	assertNoError(targetCmd.Start(), t, "execute issue2023")
 
@@ -1014,13 +1063,13 @@ func TestTracePid(t *testing.T) {
 }
 
 func TestTraceBreakpointExists(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	fixtures := protest.FindFixturesDir()
 	// We always set breakpoints on some runtime functions at startup, so this would return with
 	// a breakpoints exists error.
 	// TODO: Perhaps we shouldn't be setting these default breakpoints in trace mode, however.
-	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "issue573.go"), "runtime.*")
+	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(t.TempDir(), "__debug"), filepath.Join(fixtures, "issue573.go"), "runtime.*panic")
 	rdr, err := cmd.StderrPipe()
 	assertNoError(err, t, "stderr pipe")
 	defer rdr.Close()
@@ -1040,7 +1089,7 @@ func TestTraceBreakpointExists(t *testing.T) {
 }
 
 func TestTracePrintStack(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	fixtures := protest.FindFixturesDir()
 	cmd := exec.Command(dlvbin, "trace", "--output", filepath.Join(t.TempDir(), "__debug"), "--stack", "2", filepath.Join(fixtures, "issue573.go"), "foo")
@@ -1079,7 +1128,7 @@ func TestTraceEBPF(t *testing.T) {
 		t.Skip("test must be run as root")
 	}
 
-	dlvbin := getDlvBinEBPF(t)
+	dlvbin := protest.GetDlvBinaryEBPF(t)
 
 	expected := []byte("> (1) main.foo(99, 9801)\n=> \"9900\"")
 
@@ -1118,7 +1167,7 @@ func TestTraceEBPF2(t *testing.T) {
 		t.Skip("test must be run as root")
 	}
 
-	dlvbin := getDlvBinEBPF(t)
+	dlvbin := protest.GetDlvBinaryEBPF(t)
 
 	expected := []byte(`> (1) main.callme(10)
 > (1) main.callme(9)
@@ -1178,7 +1227,7 @@ func TestTraceEBPF3(t *testing.T) {
 		t.Skip("test must be run as root")
 	}
 
-	dlvbin := getDlvBinEBPF(t)
+	dlvbin := protest.GetDlvBinaryEBPF(t)
 
 	expected := []byte(`> (1) main.tracedFunction(0)
 > (1) main.tracedFunction(1)
@@ -1226,7 +1275,7 @@ func TestTraceEBPF4(t *testing.T) {
 		t.Skip("test must be run as root")
 	}
 
-	dlvbin := getDlvBinEBPF(t)
+	dlvbin := protest.GetDlvBinaryEBPF(t)
 
 	expected := []byte(`> (1) main.tracedFunction(0, true, 97)
 > (1) main.tracedFunction(1, false, 98)
@@ -1257,7 +1306,7 @@ func TestTraceEBPF4(t *testing.T) {
 }
 
 func TestDlvTestChdir(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	fixtures := protest.FindFixturesDir()
 
@@ -1289,7 +1338,7 @@ func TestDlvTestChdir(t *testing.T) {
 }
 
 func TestVersion(t *testing.T) {
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 
 	got, err := exec.Command(dlvbin, "version", "-v").CombinedOutput()
 	if err != nil {
@@ -1298,7 +1347,7 @@ func TestVersion(t *testing.T) {
 	want1 := []byte("mod\tgithub.com/go-delve/delve")
 	want2 := []byte("dep\tgithub.com/google/go-dap")
 	if !bytes.Contains(got, want1) || !bytes.Contains(got, want2) {
-		t.Errorf("got %s\nwant %v and %v in the output", got, want1, want2)
+		t.Errorf("got %s\nwant %s and %s in the output", got, want1, want2)
 	}
 }
 
@@ -1318,7 +1367,7 @@ func TestStaticcheck(t *testing.T) {
 	//   where we don't do this it is a deliberate style choice.
 	// * ST1023 "Redundant type in variable declaration" same as S1021.
 	cmd := exec.Command("staticcheck", args...)
-	cmd.Dir = projectRoot()
+	cmd.Dir = protest.ProjectRoot()
 	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=amd64")
 	out, _ := cmd.CombinedOutput()
 	checkAutogenDoc(t, "_scripts/staticcheck-out.txt", fmt.Sprintf("staticcheck %s > _scripts/staticcheck-out.txt", strings.Join(args, " ")), out)
@@ -1327,7 +1376,7 @@ func TestStaticcheck(t *testing.T) {
 func TestDefaultBinary(t *testing.T) {
 	// Check that when delve is run twice in the same directory simultaneously
 	// it will pick different default output binary paths.
-	dlvbin := getDlvBin(t)
+	dlvbin := protest.GetDlvBinary(t)
 	fixture := filepath.Join(protest.FindFixturesDir(), "testargs.go")
 
 	startOne := func() (io.WriteCloser, func() error, *bytes.Buffer) {
@@ -1357,5 +1406,68 @@ func TestDefaultBinary(t *testing.T) {
 	t.Logf("%q", out2)
 	if out1 == out2 {
 		t.Errorf("outputs match")
+	}
+}
+
+func TestUnixDomainSocket(t *testing.T) {
+	tmpdir := os.TempDir()
+	if tmpdir == "" {
+		return
+	}
+
+	listenPath := filepath.Join(tmpdir, "delve_test")
+
+	dlvbin := protest.GetDlvBinary(t)
+
+	fixtures := protest.FindFixturesDir()
+
+	buildtestdir := filepath.Join(fixtures, "buildtest")
+
+	cmd := exec.Command(dlvbin, "debug", "--headless=true", "--listen=unix:"+listenPath, "--api-version=2", "--backend="+testBackend, "--log", "--log-output=debugger,rpc")
+	cmd.Dir = buildtestdir
+	stderr, err := cmd.StderrPipe()
+	assertNoError(err, t, "stderr pipe")
+	defer stderr.Close()
+
+	assertNoError(cmd.Start(), t, "dlv debug")
+
+	scan := bufio.NewScanner(stderr)
+	// wait for the debugger to start
+	for scan.Scan() {
+		text := scan.Text()
+		t.Log(text)
+		if strings.Contains(text, "API server pid = ") {
+			break
+		}
+	}
+	go func() {
+		for scan.Scan() {
+			t.Log(scan.Text())
+			// keep pipe empty
+		}
+	}()
+
+	conn, err := net.Dial("unix", listenPath)
+	assertNoError(err, t, "dialing")
+
+	client := rpc2.NewClientFromConn(conn)
+	state := <-client.Continue()
+
+	if !state.Exited {
+		t.Fatal("Program did not exit")
+	}
+
+	client.Detach(true)
+	cmd.Wait()
+}
+
+func TestDeadcodeEliminated(t *testing.T) {
+	dlvbin := protest.GetDlvBinary(t)
+	buf, err := exec.Command("go", "tool", "nm", dlvbin).CombinedOutput()
+	if err != nil {
+		t.Fatalf("error executing go tool nm %s: %v", dlvbin, err)
+	}
+	if strings.Contains(string(buf), "MethodByName") {
+		t.Fatal("output of go tool nm contains MethodByName")
 	}
 }

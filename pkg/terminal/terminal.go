@@ -3,6 +3,7 @@ package terminal
 //lint:file-ignore ST1005 errors here can be capitalized
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/rpc"
@@ -59,6 +60,8 @@ type Term struct {
 	InitFile string
 	displays []displayEntry
 	oldPid   int
+
+	stackTraceColors api.StackTraceColors
 
 	historyFile *os.File
 
@@ -160,6 +163,17 @@ func (t *Term) updateColorScheme() {
 	case nil:
 		t.stdout.colorEscapes[colorize.LineNoStyle] = fmt.Sprintf(terminalHighlightEscapeCode, ansiBlue)
 	}
+
+	wd2 := func(s, defaultStr string) string {
+		if s == "" {
+			return defaultStr
+		}
+		return s
+	}
+
+	t.stackTraceColors.FunctionColor = wd2(conf.StackTraceFunctionColor, "\033[1m")
+	t.stackTraceColors.BasenameColor = wd2(conf.StackTraceBasenameColor, "\033[1m")
+	t.stackTraceColors.NormalColor = terminalResetEscapeCode
 }
 
 func (t *Term) updateTab() {
@@ -229,7 +243,6 @@ func (t *Term) sigintGuard(ch <-chan os.Signal, multiClient bool) {
 			default:
 				fmt.Fprintln(t.stdout, "only p or q allowed")
 			}
-
 		} else {
 			fmt.Fprintf(t.stdout, "received SIGINT, stopping process (will not forward signal)\n")
 			_, err := t.client.Halt()
@@ -253,7 +266,7 @@ func (t *Term) Run() (int, error) {
 
 	fns := trie.New()
 	cmds := trie.New()
-	funcs, _ := t.client.ListFunctions("")
+	funcs, _ := t.client.ListFunctions("", 0)
 	for _, fn := range funcs {
 		fns.Add(fn, nil)
 	}
@@ -347,7 +360,7 @@ func (t *Term) Run() (int, error) {
 				fmt.Fprintln(t.stdout, "exit")
 				return t.handleExit()
 			}
-			return 1, fmt.Errorf("Prompt for input failed.\n")
+			return 1, errors.New("Prompt for input failed.\n")
 		}
 		t.stdout.Echo(t.prompt + cmdstr + "\n")
 
@@ -423,6 +436,10 @@ func (t *Term) formatPath(path string) string {
 }
 
 func (t *Term) promptForInput() (string, error) {
+	if t.stdout.colorEscapes != nil && t.conf.PromptColor != "" {
+		fmt.Fprint(os.Stdout, t.conf.PromptColor)
+		defer fmt.Fprint(os.Stdout, terminalResetEscapeCode)
+	}
 	l, err := t.line.Prompt(t.prompt)
 	if err != nil {
 		return "", err
@@ -436,7 +453,7 @@ func (t *Term) promptForInput() (string, error) {
 	return l, nil
 }
 
-func yesno(line *liner.State, question, defaultAnswer string) (bool, error) {
+var yesno = func(line *liner.State, question, defaultAnswer string) (bool, error) {
 	for {
 		answer, err := line.Prompt(question)
 		if err != nil {

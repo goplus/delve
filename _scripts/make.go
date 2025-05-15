@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -50,11 +51,11 @@ func NewMakeCommands() *cobra.Command {
 				envflags = append(envflags, "GOOS="+OS)
 			}
 			if len(envflags) > 0 {
-				executeEnv(envflags, "go", "build", "-ldflags", "-extldflags -static", tagFlags(), buildFlags(), DelveMainPackagePath)
+				executeEnv(envflags, "go", "build", "-ldflags", "-extldflags -static", tagFlags(false), buildFlags(), DelveMainPackagePath)
 			} else {
-				execute("go", "build", "-ldflags", "-extldflags -static", tagFlags(), buildFlags(), DelveMainPackagePath)
+				execute("go", "build", "-ldflags", "-extldflags -static", tagFlags(false), buildFlags(), DelveMainPackagePath)
 			}
-			if runtime.GOOS == "darwin" && os.Getenv("CERT") != "" && canMacnative() {
+			if runtime.GOOS == "darwin" && os.Getenv("CERT") != "" && canMacnative() && !isCodesigned("./dlv") {
 				codesign("./dlv")
 			}
 		},
@@ -69,8 +70,8 @@ func NewMakeCommands() *cobra.Command {
 		Use:   "install",
 		Short: "Installs delve",
 		Run: func(cmd *cobra.Command, args []string) {
-			execute("go", "install", tagFlags(), buildFlags(), DelveMainPackagePath)
-			if runtime.GOOS == "darwin" && os.Getenv("CERT") != "" && canMacnative() {
+			execute("go", "install", tagFlags(false), buildFlags(), DelveMainPackagePath)
+			if runtime.GOOS == "darwin" && os.Getenv("CERT") != "" && canMacnative() && !isCodesigned(installedExecutablePath()) {
 				codesign(installedExecutablePath())
 			}
 		},
@@ -111,7 +112,7 @@ This option can only be specified if testset is basic or a single package.`)
 	test.PersistentFlags().StringVarP(&TestBuildMode, "test-build-mode", "m", "", `Runs tests compiling with the specified build mode, one of either:
 	normal		normal buildmode (default)
 	pie		PIE buildmode
-	
+
 This option can only be specified if testset is basic or a single package.`)
 	test.PersistentFlags().BoolVarP(&TestIncludePIE, "pie", "", true, "Standard testing should include PIE")
 
@@ -129,6 +130,9 @@ This option can only be specified if testset is basic or a single package.`)
 }
 
 func checkCert() bool {
+	if os.Getenv("NOCERT") != "" {
+		return false
+	}
 	// If we're on OSX make sure the proper CERT env var is set.
 	if runtime.GOOS != "darwin" || os.Getenv("CERT") != "" {
 		return true
@@ -225,6 +229,15 @@ func getoutput(cmd string, args ...interface{}) string {
 	return string(out)
 }
 
+func isCodesigned(path string) bool {
+	x := exec.Command("codesign", "--verify", path)
+	x.Stdout = io.Discard
+	x.Stderr = io.Discard
+	x.Env = os.Environ()
+	err := x.Run()
+	return err == nil && x.ProcessState != nil && x.ProcessState.Success()
+}
+
 func codesign(path string) {
 	execute("codesign", "-s", os.Getenv("CERT"), path)
 }
@@ -283,16 +296,24 @@ func prepareMacnative() string {
 	return "macnative"
 }
 
-func tagFlags() string {
+func tagFlags(isTest bool) string {
 	var tags []string
 	if mactags := prepareMacnative(); mactags != "" {
 		tags = append(tags, mactags)
 	}
-	if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
-		tags = append(tags, "exp.winarm64")
-	}
-	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
-		tags = append(tags, "exp.linuxppc64le")
+	if isTest {
+		if runtime.GOOS == "windows" && runtime.GOARCH == "arm64" {
+			tags = append(tags, "exp.winarm64")
+		}
+		if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64le" {
+			tags = append(tags, "exp.linuxppc64le")
+		}
+		if runtime.GOOS == "linux" && runtime.GOARCH == "riscv64" {
+			tags = append(tags, "exp.linuxriscv64")
+		}
+		if runtime.GOOS == "linux" && runtime.GOARCH == "loong64" {
+			tags = append(tags, "exp.linuxloong64")
+		}
 	}
 	if Tags != nil && len(*Tags) > 0 {
 		tags = append(tags, *Tags...)
@@ -311,7 +332,7 @@ func buildFlags() []string {
 	} else {
 		ldFlags = "-X main.Build=" + buildSHA
 	}
-	if runtime.GOOS == "darwin" {
+	if runtime.GOOS == "darwin" && os.Getenv("CERT") != "" {
 		ldFlags = "-s " + ldFlags
 	}
 	return []string{fmt.Sprintf("-ldflags=%s", ldFlags)}
@@ -452,11 +473,11 @@ func testCmdIntl(testSet, testRegex, testBackend, testBuildMode string) {
 	}
 
 	if len(testPackages) > 3 {
-		executeq(env, "go", "test", testFlags(), buildFlags(), tagFlags(), testPackages, backendFlag, buildModeFlag)
+		executeq(env, "go", "test", testFlags(), buildFlags(), tagFlags(true), testPackages, backendFlag, buildModeFlag)
 	} else if testRegex != "" {
-		executeq(env, "go", "test", testFlags(), buildFlags(), tagFlags(), testPackages, "-run="+testRegex, backendFlag, buildModeFlag)
+		executeq(env, "go", "test", testFlags(), buildFlags(), tagFlags(true), testPackages, "-run="+testRegex, backendFlag, buildModeFlag)
 	} else {
-		executeq(env, "go", "test", testFlags(), buildFlags(), tagFlags(), testPackages, backendFlag, buildModeFlag)
+		executeq(env, "go", "test", testFlags(), buildFlags(), tagFlags(true), testPackages, backendFlag, buildModeFlag)
 	}
 }
 
@@ -495,7 +516,7 @@ func inpath(exe string) bool {
 
 func allPackages() []string {
 	r := []string{}
-	for _, dir := range strings.Split(getoutput("go", "list", "-mod=vendor", tagFlags(), "./..."), "\n") {
+	for _, dir := range strings.Split(getoutput("go", "list", "-mod=vendor", tagFlags(true), "./..."), "\n") {
 		dir = strings.TrimSpace(dir)
 		if dir == "" || strings.Contains(dir, "/vendor/") || strings.Contains(dir, "/_scripts") {
 			continue

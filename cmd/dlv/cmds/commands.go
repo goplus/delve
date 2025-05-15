@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -35,8 +36,8 @@ import (
 )
 
 var (
-	// log is whether to log debug statements.
-	log bool
+	// logFlag is whether to log debug statements.
+	logFlag bool
 	// logOutput is a comma separated list of components that should produce debug output.
 	logOutput string
 	// logDest is the file path or file descriptor where logs should go.
@@ -87,6 +88,7 @@ var (
 	traceStackDepth    int
 	traceUseEBPF       bool
 	traceShowTimestamp bool
+	traceFollowCalls   int
 
 	// redirect specifications for target process
 	redirects []string
@@ -137,22 +139,31 @@ func New(docCall bool) *cobra.Command {
 		Long:  dlvCommandLongDesc,
 	}
 
-	rootCommand.PersistentFlags().StringVarP(&addr, "listen", "l", "127.0.0.1:0", "Debugging server listen address.")
+	rootCommand.PersistentFlags().StringVarP(&addr, "listen", "l", "127.0.0.1:0", "Debugging server listen address. Prefix with 'unix:' to use a unix domain socket.")
+	must(rootCommand.RegisterFlagCompletionFunc("listen", cobra.NoFileCompletions))
 
-	rootCommand.PersistentFlags().BoolVarP(&log, "log", "", false, "Enable debugging server logging.")
+	rootCommand.PersistentFlags().BoolVarP(&logFlag, "log", "", false, "Enable debugging server logging.")
 	rootCommand.PersistentFlags().StringVarP(&logOutput, "log-output", "", "", `Comma separated list of components that should produce debug output (see 'dlv help log')`)
+	must(rootCommand.RegisterFlagCompletionFunc("log-output", cobra.FixedCompletions([]string{"debugger", "gdbwire", "lldbout", "debuglineerr", "rpc", "dap", "fncall", "minidump", "stack"}, cobra.ShellCompDirectiveNoFileComp)))
 	rootCommand.PersistentFlags().StringVarP(&logDest, "log-dest", "", "", "Writes logs to the specified file or file descriptor (see 'dlv help log').")
+	must(rootCommand.MarkPersistentFlagFilename("log-dest", "log"))
 
 	rootCommand.PersistentFlags().BoolVarP(&headless, "headless", "", false, "Run debug server only, in headless mode. Server will accept both JSON-RPC or DAP client connections.")
 	rootCommand.PersistentFlags().BoolVarP(&acceptMulti, "accept-multiclient", "", false, "Allows a headless server to accept multiple client connections via JSON-RPC or DAP.")
-	rootCommand.PersistentFlags().IntVar(&apiVersion, "api-version", 1, "Selects JSON-RPC API version when headless. New clients should use v2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md.")
+	rootCommand.PersistentFlags().IntVar(&apiVersion, "api-version", 2, "Selects JSON-RPC API version when headless. The only valid value is 2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md.")
+	must(rootCommand.RegisterFlagCompletionFunc("api-version", cobra.FixedCompletions([]string{"1", "2"}, cobra.ShellCompDirectiveNoFileComp)))
 	rootCommand.PersistentFlags().StringVar(&initFile, "init", "", "Init file, executed by the terminal client.")
+	must(rootCommand.MarkPersistentFlagFilename("init"))
 	rootCommand.PersistentFlags().StringVar(&buildFlags, "build-flags", buildFlagsDefault, "Build flags, to be passed to the compiler. For example: --build-flags=\"-tags=integration -mod=vendor -cover -v\"")
+	must(rootCommand.RegisterFlagCompletionFunc("build-flags", cobra.NoFileCompletions))
 	rootCommand.PersistentFlags().StringVar(&workingDir, "wd", "", "Working directory for running the program.")
+	must(rootCommand.MarkPersistentFlagDirname("wd"))
 	rootCommand.PersistentFlags().BoolVarP(&checkGoVersion, "check-go-version", "", true, "Exits if the version of Go in use is not compatible (too old or too new) with the version of Delve.")
 	rootCommand.PersistentFlags().BoolVarP(&checkLocalConnUser, "only-same-user", "", true, "Only connections from the same user that started this instance of Delve are allowed to connect.")
 	rootCommand.PersistentFlags().StringVar(&backend, "backend", "default", `Backend selection (see 'dlv help backend').`)
+	must(rootCommand.RegisterFlagCompletionFunc("backend", cobra.FixedCompletions([]string{"default", "native", "lldb", "rr"}, cobra.ShellCompDirectiveNoFileComp)))
 	rootCommand.PersistentFlags().StringArrayVarP(&redirects, "redirect", "r", []string{}, "Specifies redirect rules for target process (see 'dlv help redirect')")
+	must(rootCommand.MarkPersistentFlagFilename("redirect"))
 	rootCommand.PersistentFlags().BoolVar(&allowNonTerminalInteractive, "allow-non-terminal-interactive", false, "Allows interactive sessions of Delve that don't have a terminal as stdin, stdout and stderr")
 	rootCommand.PersistentFlags().BoolVar(&disableASLR, "disable-aslr", false, "Disables address space randomization")
 
@@ -173,25 +184,35 @@ option to let the process continue or kill it.
 			return nil
 		},
 		Run: attachCmd,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) != 1 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveDefault
+		},
 	}
 	attachCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
 	attachCommand.Flags().StringVar(&attachWaitFor, "waitfor", "", "Wait for a process with a name beginning with this prefix")
+	must(attachCommand.RegisterFlagCompletionFunc("waitfor", cobra.NoFileCompletions))
 	attachCommand.Flags().Float64Var(&attachWaitForInterval, "waitfor-interval", 1, "Interval between checks of the process list, in millisecond")
+	must(attachCommand.RegisterFlagCompletionFunc("waitfor-interval", cobra.NoFileCompletions))
 	attachCommand.Flags().Float64Var(&attachWaitForDuration, "waitfor-duration", 0, "Total time to wait for a process")
+	must(attachCommand.RegisterFlagCompletionFunc("waitfor-duration", cobra.NoFileCompletions))
 	rootCommand.AddCommand(attachCommand)
 
 	// 'connect' subcommand.
 	connectCommand := &cobra.Command{
 		Use:   "connect addr",
 		Short: "Connect to a headless debug server with a terminal client.",
-		Long:  "Connect to a running headless debug server with a terminal client.",
+		Long:  "Connect to a running headless debug server with a terminal client. Prefix with 'unix:' to use a unix domain socket.",
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				return errors.New("you must provide an address as the first argument")
 			}
 			return nil
 		},
-		Run: connectCmd,
+		Run:               connectCmd,
+		ValidArgsFunction: cobra.NoFileCompletions,
 	}
 	rootCommand.AddCommand(connectCommand)
 
@@ -220,9 +241,11 @@ execution is resumed at the start of the debug session.
 The --client-addr flag is a special flag that makes the server initiate a debug session
 by dialing in to the host:port where a DAP client is waiting. This server process
 will exit when the debug session ends.`,
-		Run: dapCmd,
+		Run:               dapCmd,
+		ValidArgsFunction: cobra.NoFileCompletions,
 	}
-	dapCommand.Flags().StringVar(&dapClientAddr, "client-addr", "", "host:port where the DAP client is waiting for the DAP server to dial in")
+	dapCommand.Flags().StringVar(&dapClientAddr, "client-addr", "", "Address where the DAP client is waiting for the DAP server to dial in. Prefix with 'unix:' to use a unix domain socket.")
+	must(dapCommand.RegisterFlagCompletionFunc("client-addr", cobra.NoFileCompletions))
 
 	// TODO(polina): support --tty when dlv dap allows to launch a program from command-line
 	rootCommand.AddCommand(dapCommand)
@@ -237,11 +260,14 @@ By default, with no arguments, Delve will compile the 'main' package in the
 current directory, and begin to debug it. Alternatively you can specify a
 package name and Delve will compile that package instead, and begin a new debug
 session.`,
-		Run: debugCmd,
+		Run:               debugCmd,
+		ValidArgsFunction: cobra.NoFileCompletions,
 	}
 	debugCommand.Flags().String("output", "", "Output path for the binary.")
+	must(debugCommand.MarkFlagFilename("output"))
 	debugCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
 	debugCommand.Flags().StringVar(&tty, "tty", "", "TTY to use for the target program")
+	must(debugCommand.MarkFlagFilename("tty"))
 	rootCommand.AddCommand(debugCommand)
 
 	// 'exec' subcommand.
@@ -264,8 +290,15 @@ or later, -gcflags="-N -l" on earlier versions of Go.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			os.Exit(execute(0, args, conf, "", debugger.ExecutingExistingFile, args, buildFlags))
 		},
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) != 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveDefault
+		},
 	}
 	execCommand.Flags().StringVar(&tty, "tty", "", "TTY to use for the target program")
+	must(execCommand.MarkFlagFilename("tty"))
 	execCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
 	rootCommand.AddCommand(execCommand)
 
@@ -295,9 +328,11 @@ that package instead. Double-dashes ` + "`--`" + ` can be used to pass arguments
 dlv test [package] -- -test.run TestSomething -test.v -other-argument
 
 See also: 'go help testflag'.`,
-		Run: testCmd,
+		Run:               testCmd,
+		ValidArgsFunction: cobra.NoFileCompletions,
 	}
 	testCommand.Flags().String("output", "", "Output path for the binary.")
+	must(testCommand.MarkFlagFilename("output"))
 	rootCommand.AddCommand(testCommand)
 
 	// 'trace' subcommand.
@@ -316,14 +351,20 @@ only see the output of the trace operations you can redirect stdout.`,
 		Run: func(cmd *cobra.Command, args []string) {
 			os.Exit(traceCmd(cmd, args, conf))
 		},
+		ValidArgsFunction: cobra.NoFileCompletions,
 	}
 	traceCommand.Flags().IntVarP(&traceAttachPid, "pid", "p", 0, "Pid to attach to.")
+	must(traceCommand.RegisterFlagCompletionFunc("pid", cobra.NoFileCompletions))
 	traceCommand.Flags().StringVarP(&traceExecFile, "exec", "e", "", "Binary file to exec and trace.")
+	must(traceCommand.MarkFlagFilename("exec"))
 	traceCommand.Flags().BoolVarP(&traceTestBinary, "test", "t", false, "Trace a test binary.")
 	traceCommand.Flags().BoolVarP(&traceUseEBPF, "ebpf", "", false, "Trace using eBPF (experimental).")
 	traceCommand.Flags().BoolVarP(&traceShowTimestamp, "timestamp", "", false, "Show timestamp in the output")
 	traceCommand.Flags().IntVarP(&traceStackDepth, "stack", "s", 0, "Show stack trace with given depth. (Ignored with --ebpf)")
+	must(traceCommand.RegisterFlagCompletionFunc("stack", cobra.NoFileCompletions))
 	traceCommand.Flags().String("output", "", "Output path for the binary.")
+	must(traceCommand.MarkFlagFilename("output"))
+	traceCommand.Flags().IntVarP(&traceFollowCalls, "follow-calls", "", 0, "Trace all children of the function to the required depth")
 	rootCommand.AddCommand(traceCommand)
 
 	coreCommand := &cobra.Command{
@@ -343,6 +384,12 @@ Currently supports linux/amd64 and linux/arm64 core files, windows/amd64 minidum
 			return nil
 		},
 		Run: coreCmd,
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) > 2 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			return nil, cobra.ShellCompDirectiveDefault
+		},
 	}
 	// -c is unused and exists so delve can be used with coredumpctl
 	core := false
@@ -361,6 +408,7 @@ Currently supports linux/amd64 and linux/arm64 core files, windows/amd64 minidum
 				fmt.Printf("Build Details: %s\n", version.BuildInfo())
 			}
 		},
+		ValidArgsFunction: cobra.NoFileCompletions,
 	}
 	versionCommand.Flags().BoolVarP(&versionVerbose, "verbose", "v", false, "print verbose version info")
 	rootCommand.AddCommand(versionCommand)
@@ -384,10 +432,17 @@ https://github.com/mozilla/rr
 				backend = "rr"
 				os.Exit(execute(0, []string{}, conf, args[0], debugger.ExecutingOther, args, buildFlags))
 			},
+			ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+				if len(args) > 2 {
+					return nil, cobra.ShellCompDirectiveNoFileComp
+				}
+				return nil, cobra.ShellCompDirectiveDefault
+			},
 		}
 
 		replayCommand.Flags().IntVarP(&rrOnProcessPid, "onprocess", "p", 0,
 			"Pass onprocess pid to rr.")
+		must(replayCommand.RegisterFlagCompletionFunc("onprocess", cobra.NoFileCompletions))
 
 		rootCommand.AddCommand(replayCommand)
 	}
@@ -403,7 +458,13 @@ are:
 	lldb		Uses lldb-server or debugserver.
 	rr		Uses mozilla rr (https://github.com/mozilla/rr).
 
-`})
+Some backends can be configured using environment variables:
+
+* DELVE_DEBUGSERVER_PATH specifies the path of the debugserver executable for the lldb backend
+* DELVE_RR_RECORD_FLAGS specifies additional flags used when calling 'rr record'
+* DELVE_RR_REPLAY_FLAGS specifies additional flags used when calling 'rr replay'
+`,
+	})
 
 	rootCommand.AddCommand(&cobra.Command{
 		Use:   "log",
@@ -452,6 +513,24 @@ File redirects can also be changed using the 'restart' command.
 `,
 	})
 
+	rootCommand.AddCommand(&cobra.Command{
+		Use:    "substitute-path-guess-helper",
+		Hidden: true,
+		Run: func(cmd *cobra.Command, args []string) {
+			gsp, err := rpc2.MakeGuessSusbtitutePathIn()
+			if err != nil {
+				fmt.Printf("ERROR: %v\n", err)
+				os.Exit(1)
+			}
+			err = json.NewEncoder(os.Stdout).Encode(gsp)
+			if err != nil {
+				fmt.Printf("ERROR: %v\n", err)
+				os.Exit(1)
+			}
+			os.Exit(0)
+		},
+	})
+
 	rootCommand.DisableAutoGenTag = true
 
 	configUsageFunc(rootCommand)
@@ -461,7 +540,7 @@ File redirects can also be changed using the 'restart' command.
 
 func dapCmd(cmd *cobra.Command, args []string) {
 	status := func() int {
-		if err := logflags.Setup(log, logOutput, logDest); err != nil {
+		if err := logflags.Setup(logFlag, logOutput, logDest); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			return 1
 		}
@@ -514,19 +593,14 @@ func dapCmd(cmd *cobra.Command, args []string) {
 		}
 		var conn net.Conn
 		if dapClientAddr == "" {
-			listener, err := net.Listen("tcp", addr)
+			listener, err := netListen(addr)
 			if err != nil {
 				fmt.Printf("couldn't start listener: %s\n", err)
 				return 1
 			}
 			cfg.Listener = listener
 		} else { // with a predetermined client.
-			var err error
-			conn, err = net.Dial("tcp", dapClientAddr)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to connect to the DAP client: %v\n", err)
-				return 1
-			}
+			conn = netDial(dapClientAddr)
 		}
 
 		server := dap.NewServer(cfg)
@@ -596,7 +670,7 @@ func debugCmd(cmd *cobra.Command, args []string) {
 
 func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 	status := func() int {
-		err := logflags.Setup(log, logOutput, logDest)
+		err := logflags.Setup(logFlag, logOutput, logDest)
 		defer logflags.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -649,6 +723,10 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 
 			processArgs = append([]string{debugname}, targetArgs...)
 		}
+		if dlvArgsLen >= 3 && traceFollowCalls <= 0 {
+			fmt.Fprintln(os.Stderr, "Need to specify a trace depth of at least 1")
+			return 1
+		}
 
 		// Make a local in-memory connection that client and server use to communicate
 		listener, clientConn := service.ListenerPipe()
@@ -685,8 +763,7 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 			<-ch
 			client.Halt()
 		}()
-
-		funcs, err := client.ListFunctions(regexp)
+		funcs, err := client.ListFunctions(regexp, traceFollowCalls)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
@@ -702,13 +779,22 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 				}
 			} else {
 				// Fall back to breakpoint based tracing if we get an error.
+				var stackdepth int
+				// Default size of stackdepth to trace function calls and descendants=20
+				stackdepth = traceStackDepth
+				if traceFollowCalls > 0 && stackdepth == 0 {
+					stackdepth = 20
+				}
 				_, err = client.CreateBreakpoint(&api.Breakpoint{
-					FunctionName: funcs[i],
-					Tracepoint:   true,
-					Line:         -1,
-					Stacktrace:   traceStackDepth,
-					LoadArgs:     &terminal.ShortLoadConfig,
+					FunctionName:     funcs[i],
+					Tracepoint:       true,
+					Line:             -1,
+					Stacktrace:       stackdepth,
+					LoadArgs:         &terminal.ShortLoadConfig,
+					TraceFollowCalls: traceFollowCalls,
+					RootFuncName:     regexp,
 				})
+
 				if err != nil && !isBreakpointExistsErr(err) {
 					fmt.Fprintf(os.Stderr, "unable to set tracepoint on function %s: %#v\n", funcs[i], err)
 					continue
@@ -722,11 +808,13 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 				}
 				for i := range addrs {
 					_, err = client.CreateBreakpoint(&api.Breakpoint{
-						Addr:        addrs[i],
-						TraceReturn: true,
-						Stacktrace:  traceStackDepth,
-						Line:        -1,
-						LoadArgs:    &terminal.ShortLoadConfig,
+						Addr:             addrs[i],
+						TraceReturn:      true,
+						Stacktrace:       stackdepth,
+						Line:             -1,
+						LoadArgs:         &terminal.ShortLoadConfig,
+						TraceFollowCalls: traceFollowCalls,
+						RootFuncName:     regexp,
 					})
 					if err != nil && !isBreakpointExistsErr(err) {
 						fmt.Fprintf(os.Stderr, "unable to set tracepoint on function %s: %#v\n", funcs[i], err)
@@ -862,7 +950,7 @@ func coreCmd(_ *cobra.Command, args []string) {
 }
 
 func connectCmd(_ *cobra.Command, args []string) {
-	if err := logflags.Setup(log, logOutput, logDest); err != nil {
+	if err := logflags.Setup(logFlag, logOutput, logDest); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 		return
@@ -917,11 +1005,12 @@ func splitArgs(cmd *cobra.Command, args []string) ([]string, []string) {
 func connect(addr string, clientConn net.Conn, conf *config.Config) int {
 	// Create and start a terminal - attach to running instance
 	var client *rpc2.RPCClient
-	if clientConn != nil {
-		client = rpc2.NewClientFromConn(clientConn)
-	} else {
-		client = rpc2.NewClient(addr)
+	if clientConn == nil {
+		if clientConn = netDial(addr); clientConn == nil {
+			return 1 // already logged
+		}
 	}
+	client = rpc2.NewClientFromConn(clientConn)
 	if client.IsMulticlient() {
 		state, _ := client.GetStateNonBlocking()
 		// The error return of GetState will usually be the ErrProcessExited,
@@ -946,7 +1035,7 @@ func connect(addr string, clientConn net.Conn, conf *config.Config) int {
 }
 
 func execute(attachPid int, processArgs []string, conf *config.Config, coreFile string, kind debugger.ExecuteKind, dlvArgs []string, buildFlags string) int {
-	if err := logflags.Setup(log, logOutput, logDest); err != nil {
+	if err := logflags.Setup(logFlag, logOutput, logDest); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 1
 	}
@@ -1007,7 +1096,7 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 
 	// Make a TCP listener
 	if headless {
-		listener, err = net.Listen("tcp", addr)
+		listener, err = netListen(addr)
 	} else {
 		listener, clientConn = service.ListenerPipe()
 	}
@@ -1079,10 +1168,13 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 		return 1
 	}
 
-	var status int
 	if headless {
 		if continueOnStart {
-			client := rpc2.NewClient(listener.Addr().String())
+			addr := listener.Addr().String()
+			if _, isuds := listener.(*net.UnixListener); isuds {
+				addr = "unix:" + addr
+			}
+			client := rpc2.NewClientFromConn(netDial(addr))
 			client.Disconnect(true) // true = continue after disconnect
 		}
 		waitForDisconnectSignal(disconnectChan)
@@ -1091,7 +1183,7 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 			fmt.Println(err)
 		}
 
-		return status
+		return 0
 	}
 
 	return connect(listener.Addr().String(), clientConn, conf)
@@ -1132,4 +1224,33 @@ func configUsageFunc(cmd *cobra.Command) {
 		helphelpers.Prepare(cmd)
 		return usage(cmd)
 	})
+}
+
+const unixAddrPrefix = "unix:"
+
+func netListen(addr string) (net.Listener, error) {
+	if strings.HasPrefix(addr, unixAddrPrefix) {
+		return net.Listen("unix", addr[len(unixAddrPrefix):])
+	}
+	return net.Listen("tcp", addr)
+}
+
+func netDial(addr string) net.Conn {
+	var conn net.Conn
+	var err error
+	if strings.HasPrefix(addr, unixAddrPrefix) {
+		conn, err = net.Dial("unix", addr[len(unixAddrPrefix):])
+	} else {
+		conn, err = net.Dial("tcp", addr)
+	}
+	if err != nil {
+		logflags.RPCLogger().Errorf("error dialing %s: %v", addr, err)
+	}
+	return conn
+}
+
+func must(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
 }

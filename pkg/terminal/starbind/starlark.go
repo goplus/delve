@@ -2,6 +2,7 @@ package starbind
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,9 +12,10 @@ import (
 	"sync"
 
 	startime "go.starlark.net/lib/time"
-	"go.starlark.net/resolve"
 	"go.starlark.net/starlark"
+	"go.starlark.net/syntax"
 
+	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
 )
@@ -32,14 +34,12 @@ const (
 	helpBuiltinName              = "help"
 )
 
-func init() {
-	resolve.AllowNestedDef = true
-	resolve.AllowLambda = true
-	resolve.AllowFloat = true
-	resolve.AllowSet = true
-	resolve.AllowBitwise = true
-	resolve.AllowRecursion = true
-	resolve.AllowGlobalReassign = true
+var defaultSyntaxFileOpts = &syntax.FileOptions{
+	Set:             true,
+	While:           true,
+	TopLevelControl: true,
+	GlobalReassign:  true,
+	Recursion:       true,
 }
 
 // Context is the context in which starlark scripts are evaluated.
@@ -88,7 +88,7 @@ func New(ctx Context, out EchoWriter) *Env {
 		for i := range args {
 			a, ok := args[i].(starlark.String)
 			if !ok {
-				return nil, fmt.Errorf("argument of dlv_command is not a string")
+				return nil, errors.New("argument of dlv_command is not a string")
 			}
 			argstrs[i] = string(a)
 		}
@@ -102,11 +102,11 @@ func New(ctx Context, out EchoWriter) *Env {
 
 	env.env[readFileBuiltinName] = starlark.NewBuiltin(readFileBuiltinName, func(thread *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		if len(args) != 1 {
-			return nil, decorateError(thread, fmt.Errorf("wrong number of arguments"))
+			return nil, decorateError(thread, errors.New("wrong number of arguments"))
 		}
 		path, ok := args[0].(starlark.String)
 		if !ok {
-			return nil, decorateError(thread, fmt.Errorf("argument of read_file was not a string"))
+			return nil, decorateError(thread, errors.New("argument of read_file was not a string"))
 		}
 		buf, err := os.ReadFile(string(path))
 		if err != nil {
@@ -118,11 +118,11 @@ func New(ctx Context, out EchoWriter) *Env {
 
 	env.env[writeFileBuiltinName] = starlark.NewBuiltin(writeFileBuiltinName, func(thread *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 		if len(args) != 2 {
-			return nil, decorateError(thread, fmt.Errorf("wrong number of arguments"))
+			return nil, decorateError(thread, errors.New("wrong number of arguments"))
 		}
 		path, ok := args[0].(starlark.String)
 		if !ok {
-			return nil, decorateError(thread, fmt.Errorf("first argument of write_file was not a string"))
+			return nil, decorateError(thread, errors.New("first argument of write_file was not a string"))
 		}
 		err := os.WriteFile(string(path), []byte(args[1].String()), 0o640)
 		return starlark.None, decorateError(thread, err)
@@ -203,6 +203,7 @@ func (env *Env) Execute(path string, source interface{}, mainFnName string, args
 		if err == nil {
 			return
 		}
+		logflags.Bug.Inc()
 		_err = fmt.Errorf("panic executing starlark script: %v", err)
 		fmt.Fprintf(env.out, "panic executing starlark script: %v\n", err)
 		for i := 0; ; i++ {
@@ -220,7 +221,7 @@ func (env *Env) Execute(path string, source interface{}, mainFnName string, args
 	}()
 
 	thread := env.newThread()
-	globals, err := starlark.ExecFile(thread, path, source, env.env)
+	globals, err := execFileOptions(nil, thread, path, source, env.env)
 	if err != nil {
 		return starlark.None, err
 	}
@@ -305,7 +306,7 @@ func (env *Env) createCommand(name string, val starlark.Value) error {
 
 	env.ctx.RegisterCommand(name, helpMsg, func(args string) error {
 		thread := env.newThread()
-		argval, err := starlark.Eval(thread, "<input>", "("+args+")", env.env)
+		argval, err := evalOptions(nil, thread, "<input>", "("+args+")", env.env)
 		if err != nil {
 			return err
 		}
@@ -368,4 +369,31 @@ type EchoWriter interface {
 	io.Writer
 	Echo(string)
 	Flush()
+}
+
+// execFileOptions is a wrapper around starlark.ExecFileOptions.
+// If no options are provided, it uses default options.
+func execFileOptions(opts *syntax.FileOptions, thread *starlark.Thread, path string, source any, env starlark.StringDict) (starlark.StringDict, error) {
+	if opts == nil {
+		opts = defaultSyntaxFileOpts
+	}
+	return starlark.ExecFileOptions(opts, thread, path, source, env)
+}
+
+// evalOptions is a wrapper around starlark.EvalOptions.
+// If no options are provided, it uses default options.
+func evalOptions(opts *syntax.FileOptions, thread *starlark.Thread, path string, source any, env starlark.StringDict) (starlark.Value, error) {
+	if opts == nil {
+		opts = defaultSyntaxFileOpts
+	}
+	return starlark.EvalOptions(opts, thread, path, source, env)
+}
+
+// evalExprOptions is a wrapper around starlark.EvalExprOptions.
+// If no options are provided, it uses default options.
+func evalExprOptions(opts *syntax.FileOptions, thread *starlark.Thread, expr syntax.Expr, globals starlark.StringDict) (starlark.Value, error) {
+	if opts == nil {
+		opts = defaultSyntaxFileOpts
+	}
+	return starlark.EvalExprOptions(opts, thread, expr, globals)
 }

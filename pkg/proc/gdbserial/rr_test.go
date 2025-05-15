@@ -1,9 +1,9 @@
 package gdbserial_test
 
 import (
+	"errors"
 	"flag"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -20,11 +20,11 @@ func TestMain(m *testing.M) {
 	flag.StringVar(&logConf, "log", "", "configures logging")
 	flag.Parse()
 	logflags.Setup(logConf != "", logConf, "")
-	os.Exit(protest.RunTestsWithFixtures(m))
+	protest.RunTestsWithFixtures(m)
 }
 
 func withTestRecording(name string, t testing.TB, fn func(grp *proc.TargetGroup, fixture protest.Fixture)) {
-	fixture := protest.BuildFixture(name, 0)
+	fixture := protest.BuildFixture(t, name, 0)
 	protest.MustHaveRecordingAllowed(t)
 	if path, _ := exec.LookPath("rr"); path == "" {
 		t.Skip("test skipped, rr not found")
@@ -73,23 +73,23 @@ func TestRestartAfterExit(t *testing.T) {
 		p := grp.Selected
 		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(grp.Continue(), t, "Continue")
-		loc, err := p.CurrentThread().Location()
+		loc, err := proc.ThreadLocation(p.CurrentThread())
 		assertNoError(err, t, "CurrentThread().Location()")
 		err = grp.Continue()
-		if _, isexited := err.(proc.ErrProcessExited); err == nil || !isexited {
+		if !errors.As(err, &proc.ErrProcessExited{}) {
 			t.Fatalf("program did not exit: %v", err)
 		}
 
 		assertNoError(grp.Restart(""), t, "Restart")
 
 		assertNoError(grp.Continue(), t, "Continue (after restart)")
-		loc2, err := p.CurrentThread().Location()
+		loc2, err := proc.ThreadLocation(p.CurrentThread())
 		assertNoError(err, t, "CurrentThread().Location() (after restart)")
 		if loc2.Line != loc.Line {
 			t.Fatalf("stopped at %d (expected %d)", loc2.Line, loc.Line)
 		}
 		err = grp.Continue()
-		if _, isexited := err.(proc.ErrProcessExited); err == nil || !isexited {
+		if !errors.As(err, &proc.ErrProcessExited{}) {
 			t.Fatalf("program did not exit (after exit): %v", err)
 		}
 	})
@@ -101,19 +101,19 @@ func TestRestartDuringStop(t *testing.T) {
 		p := grp.Selected
 		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(grp.Continue(), t, "Continue")
-		loc, err := p.CurrentThread().Location()
+		loc, err := proc.ThreadLocation(p.CurrentThread())
 		assertNoError(err, t, "CurrentThread().Location()")
 
 		assertNoError(grp.Restart(""), t, "Restart")
 
 		assertNoError(grp.Continue(), t, "Continue (after restart)")
-		loc2, err := p.CurrentThread().Location()
+		loc2, err := proc.ThreadLocation(p.CurrentThread())
 		assertNoError(err, t, "CurrentThread().Location() (after restart)")
 		if loc2.Line != loc.Line {
 			t.Fatalf("stopped at %d (expected %d)", loc2.Line, loc.Line)
 		}
 		err = grp.Continue()
-		if _, isexited := err.(proc.ErrProcessExited); err == nil || !isexited {
+		if !errors.As(err, &proc.ErrProcessExited{}) {
 			t.Fatalf("program did not exit (after exit): %v", err)
 		}
 	})
@@ -143,7 +143,7 @@ func TestReverseBreakpointCounts(t *testing.T) {
 		p := grp.Selected
 		endbp := setFileBreakpoint(p, t, fixture, 28)
 		assertNoError(grp.Continue(), t, "Continue()")
-		loc, _ := p.CurrentThread().Location()
+		loc, _ := proc.ThreadLocation(p.CurrentThread())
 		if loc.PC != endbp.Addr {
 			t.Fatalf("did not reach end of main.main function: %s:%d (%#x)", loc.File, loc.Line, loc.PC)
 		}
@@ -156,7 +156,7 @@ func TestReverseBreakpointCounts(t *testing.T) {
 	countLoop:
 		for {
 			assertNoError(grp.Continue(), t, "Continue()")
-			loc, _ := p.CurrentThread().Location()
+			loc, _ := proc.ThreadLocation(p.CurrentThread())
 			switch loc.PC {
 			case startbp.Addr:
 				break countLoop
@@ -188,7 +188,7 @@ func getPosition(grp *proc.TargetGroup, t *testing.T) (when string, loc *proc.Lo
 	var err error
 	when, err = grp.When()
 	assertNoError(err, t, "When")
-	loc, err = grp.Selected.CurrentThread().Location()
+	loc, err = proc.ThreadLocation(grp.Selected.CurrentThread())
 	assertNoError(err, t, "Location")
 	return
 }

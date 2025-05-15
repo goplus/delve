@@ -11,7 +11,7 @@
 // The protocol is specified at:
 //   https://sourceware.org/gdb/onlinedocs/gdb/Remote-Protocol.html
 // with additional documentation for lldb specific extensions described at:
-//   https://github.com/llvm/llvm-project/blob/main/lldb/docs/lldb-gdb-remote.txt
+//   https://github.com/llvm/llvm-project/blob/main/lldb/docs/resources/lldbgdbremote.md
 //
 // Terminology:
 //  * inferior: the program we are trying to debug
@@ -182,6 +182,7 @@ type gdbThread struct {
 	sig               uint8  // signal received by thread after last stop
 	setbp             bool   // thread was stopped because of a breakpoint
 	watchAddr         uint64 // if > 0 this is the watchpoint address
+	watchReg          int    // if < 0 there are no active watchpoints returned
 	common            proc.CommonThread
 }
 
@@ -199,6 +200,7 @@ func (err *ErrBackendUnavailable) Error() string {
 type gdbRegisters struct {
 	regs     map[string]gdbRegister
 	regsInfo []gdbRegisterInfo
+	loaded   []bool
 	tls      uint64
 	gaddr    uint64
 	hasgaddr bool
@@ -296,6 +298,9 @@ func (p *gdbProcess) Listen(listener net.Listener, path, cmdline string, pid int
 		return p.Connect(conn, path, cmdline, pid, debugInfoDirs, stopReason)
 	case status := <-p.waitChan:
 		listener.Close()
+		if err := checkRosettaExpensive(); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("stub exited while waiting for connection: %v", status)
 	}
 }
@@ -309,6 +314,9 @@ func (p *gdbProcess) Dial(addr string, path, cmdline string, pid int, debugInfoD
 		}
 		select {
 		case status := <-p.waitChan:
+			if err := checkRosettaExpensive(); err != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf("stub exited while attempting to connect: %v", status)
 		default:
 		}
@@ -725,7 +733,7 @@ func (p *gdbProcess) initialize(path, cmdline string, debugInfoDirs []string, st
 		}
 	}
 
-	err = p.updateThreadList(&threadUpdater{p: p})
+	err = p.updateThreadList(&threadUpdater{p: p}, nil)
 	if err != nil {
 		p.conn.conn.Close()
 		p.bi.Close()
@@ -851,7 +859,13 @@ func (p *gdbProcess) ContinueOnce(cctx *proc.ContinueOnceContext) (proc.Thread, 
 	if p.conn.direction == proc.Forward {
 		// step threads stopped at any breakpoint over their breakpoint
 		for _, thread := range p.threads {
-			if thread.CurrentBreakpoint.Breakpoint != nil {
+			// Do not single step over a breakpoint if it is a watchpoint. The PC will already have advanced and we
+			// won't experience the same stutter effect as with a breakpoint. Also, there is a bug in certain versions
+			// of the MacOS mach kernel where single stepping when we have hardware watchpoints set will cause the
+			// kernel to send a spurious mach exception.
+			// See: https://github.com/llvm/llvm-project/blob/b9f2c16b50f68c978e90190f46a7c0db3f39e98c/lldb/source/Plugins/Process/Utility/StopInfoMachException.cpp#L814
+			// TODO(deparker): We can skip single stepping in the case of thread.BinInfo().Arch.BreakInstrMovesPC().
+			if thread.CurrentBreakpoint.Breakpoint != nil && thread.CurrentBreakpoint.WatchType == 0 {
 				if err := thread.stepInstruction(); err != nil {
 					return nil, proc.StopUnknown, err
 				}
@@ -870,6 +884,7 @@ func (p *gdbProcess) ContinueOnce(cctx *proc.ContinueOnceContext) (proc.Thread, 
 	var trapthread *gdbThread
 	var tu = threadUpdater{p: p}
 	var atstart bool
+	var trapThreadRegs map[uint64]uint64
 continueLoop:
 	for {
 		tu.Reset()
@@ -888,7 +903,7 @@ continueLoop:
 		// NOTE: because debugserver will sometimes send two stop packets after a
 		// continue it is important that this is the very first thing we do after
 		// resume(). See comment in threadStopInfo for an explanation.
-		p.updateThreadList(&tu)
+		p.updateThreadList(&tu, sp.jstopInfo)
 
 		trapthread = p.findThreadByStrID(threadID)
 		if trapthread != nil && !p.threadStopInfo {
@@ -896,6 +911,7 @@ continueLoop:
 			// reason the thread returned by resume() stopped.
 			trapthread.sig = sp.sig
 			trapthread.watchAddr = sp.watchAddr
+			trapthread.watchReg = sp.watchReg
 		}
 
 		var shouldStop, shouldExitErr bool
@@ -905,11 +921,16 @@ continueLoop:
 			return nil, proc.StopExited, proc.ErrProcessExited{Pid: p.conn.pid}
 		}
 		if shouldStop {
+			trapThreadRegs = sp.regs
 			break continueLoop
 		}
 	}
 
 	p.clearThreadRegisters()
+	// TODO(deparker): Can we support this optimization for the RR backend?
+	if p.conn.isDebugserver {
+		trapthread.reloadRegisters(trapThreadRegs)
+	}
 
 	stopReason := proc.StopUnknown
 	if atstart {
@@ -992,7 +1013,6 @@ func (p *gdbProcess) handleThreadSignals(cctx *proc.ContinueOnceContext, trapthr
 		// Unfortunately debugserver can not convert them into signals for the
 		// process so we must stop here.
 		case debugServerTargetExcBadAccess, debugServerTargetExcBadInstruction, debugServerTargetExcArithmetic, debugServerTargetExcEmulation, debugServerTargetExcSoftware, debugServerTargetExcBreakpoint:
-
 			trapthreadCandidate = th
 			shouldStop = true
 
@@ -1082,6 +1102,10 @@ func (p *gdbProcess) Detach(_pid int, kill bool) error {
 		p.process = nil
 	}
 	p.detached = true
+	return nil
+}
+
+func (p *gdbProcess) Close() error {
 	if p.onDetach != nil {
 		p.onDetach()
 	}
@@ -1115,7 +1139,7 @@ func (p *gdbProcess) Restart(cctx *proc.ContinueOnceContext, pos string) (proc.T
 		return nil, err
 	}
 
-	err = p.updateThreadList(&threadUpdater{p: p})
+	err = p.updateThreadList(&threadUpdater{p: p}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1393,7 +1417,7 @@ func (tu *threadUpdater) Finish() {
 // Some stubs will return the list of running threads in the stop packet, if
 // this happens the threadUpdater will know that we have already updated the
 // thread list and the first step of updateThreadList will be skipped.
-func (p *gdbProcess) updateThreadList(tu *threadUpdater) error {
+func (p *gdbProcess) updateThreadList(tu *threadUpdater, jstopInfo map[int]stopPacket) error {
 	if !tu.done {
 		first := true
 		for {
@@ -1414,7 +1438,13 @@ func (p *gdbProcess) updateThreadList(tu *threadUpdater) error {
 	}
 
 	for _, th := range p.threads {
-		if p.threadStopInfo {
+		queryThreadInfo := true
+		if jstopInfo != nil {
+			// TODO(derekparker): Use jstopInfo directly, if present, instead of
+			// issuing another stop info request.
+			_, queryThreadInfo = jstopInfo[th.ID]
+		}
+		if p.threadStopInfo && queryThreadInfo {
 			sp, err := p.conn.threadStopInfo(th.strID)
 			if err != nil {
 				if isProtocolErrorUnsupported(err) {
@@ -1423,12 +1453,12 @@ func (p *gdbProcess) updateThreadList(tu *threadUpdater) error {
 				}
 				return err
 			}
-			th.setbp = (sp.reason == "breakpoint" || (sp.reason == "" && sp.sig == breakpointSignal) || (sp.watchAddr > 0))
+			th.setbp = (sp.reason == "breakpoint" || (sp.reason == "" && sp.sig == breakpointSignal) || (sp.watchAddr > 0) || (sp.watchReg >= 0))
 			th.sig = sp.sig
 			th.watchAddr = sp.watchAddr
+			th.watchReg = sp.watchReg
 		} else {
-			th.sig = 0
-			th.watchAddr = 0
+			th.clearBreakpointState()
 		}
 	}
 
@@ -1494,22 +1524,6 @@ func (t *gdbThread) ProcessMemory() proc.MemoryReadWriter {
 	return t.p
 }
 
-// Location returns the current location of this thread.
-func (t *gdbThread) Location() (*proc.Location, error) {
-	regs, err := t.Registers()
-	if err != nil {
-		return nil, err
-	}
-	if pcreg, ok := regs.(*gdbRegisters).regs[regs.(*gdbRegisters).regnames.PC]; !ok {
-		t.p.conn.log.Errorf("thread %d could not find RIP register", t.ID)
-	} else if len(pcreg.value) < t.p.bi.Arch.PtrSize() {
-		t.p.conn.log.Errorf("thread %d bad length for RIP register: %d", t.ID, len(pcreg.value))
-	}
-	pc := regs.PC()
-	f, l, fn := t.p.bi.PCToLine(pc)
-	return &proc.Location{PC: pc, File: f, Line: l, Fn: fn}, nil
-}
-
 // Breakpoint returns the current active breakpoint for this thread.
 func (t *gdbThread) Breakpoint() *proc.BreakpointState {
 	return &t.CurrentBreakpoint
@@ -1523,7 +1537,7 @@ func (t *gdbThread) ThreadID() int {
 // Registers returns the CPU registers for this thread.
 func (t *gdbThread) Registers() (proc.Registers, error) {
 	if t.regs.regs == nil {
-		if err := t.reloadRegisters(); err != nil {
+		if err := t.reloadRegisters(nil); err != nil {
 			return nil, err
 		}
 	}
@@ -1654,6 +1668,7 @@ func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo, arch *proc.Arch, regn
 	regs.regnames = regnames
 	regs.regs = make(map[string]gdbRegister)
 	regs.regsInfo = regsInfo
+	regs.loaded = make([]bool, len(regsInfo))
 
 	regsz := 0
 	for _, reginfo := range regsInfo {
@@ -1675,25 +1690,56 @@ func (regs *gdbRegisters) gdbRegisterNew(reginfo *gdbRegisterInfo) gdbRegister {
 // It will also load the address of the thread's G.
 // Loading the address of G can be done in one of two ways reloadGAlloc, if
 // the stub can allocate memory, or reloadGAtPC, if the stub can't.
-func (t *gdbThread) reloadRegisters() error {
+func (t *gdbThread) reloadRegisters(regs map[uint64]uint64) error {
 	if t.regs.regs == nil {
 		t.regs.init(t.p.conn.regsInfo, t.p.bi.Arch, t.p.regnames)
 	}
 
-	if t.p.gcmdok {
-		if err := t.p.conn.readRegisters(t.strID, t.regs.buf); err != nil {
-			gdberr, isProt := err.(*GdbProtocolError)
-			if isProtocolErrorUnsupported(err) || (t.p.conn.isDebugserver && isProt && gdberr.code == "E74") {
-				t.p.gcmdok = false
+	if regs == nil {
+		if t.p.gcmdok {
+			if err := t.p.conn.readRegisters(t.strID, t.regs.buf); err != nil {
+				gdberr, isProt := err.(*GdbProtocolError)
+				if isProtocolErrorUnsupported(err) || (t.p.conn.isDebugserver && isProt && gdberr.code == "E74") {
+					t.p.gcmdok = false
+				} else {
+					return err
+				}
 			} else {
-				return err
+				for i := range t.regs.loaded {
+					t.regs.loaded[i] = true
+				}
 			}
 		}
-	}
-	if !t.p.gcmdok {
-		for _, reginfo := range t.p.conn.regsInfo {
-			if err := t.p.conn.readRegister(t.strID, reginfo.Regnum, t.regs.regs[reginfo.Name].value); err != nil {
-				return err
+		if !t.p.gcmdok {
+			for i, reginfo := range t.p.conn.regsInfo {
+				t.regs.loaded[i] = true
+				if err := t.p.conn.readRegister(t.strID, reginfo.Regnum, t.regs.regs[reginfo.Name].value); err != nil {
+					logflags.DebuggerLogger().Errorf("Could not read register %s: %v\n", reginfo.Name, err)
+					for i := range t.regs.regs[reginfo.Name].value {
+						t.regs.regs[reginfo.Name].value[i] = 0
+					}
+					t.regs.loaded[i] = false
+				}
+			}
+		}
+	} else {
+		for i, r := range t.p.conn.regsInfo {
+			t.regs.loaded[i] = true
+			if val, ok := regs[uint64(r.Regnum)]; ok {
+				switch r.Bitsize / 8 {
+				case 8:
+					binary.BigEndian.PutUint64(t.regs.regs[r.Name].value, val)
+				case 4:
+					binary.BigEndian.PutUint32(t.regs.regs[r.Name].value, uint32(val))
+				}
+			} else {
+				if err := t.p.conn.readRegister(t.strID, r.Regnum, t.regs.regs[r.Name].value); err != nil {
+					logflags.DebuggerLogger().Errorf("Could not read register %s: %v\n", r.Name, err)
+					for i := range t.regs.regs[r.Name].value {
+						t.regs.regs[r.Name].value[i] = 0
+					}
+					t.regs.loaded[i] = false
+				}
 			}
 		}
 	}
@@ -1744,10 +1790,10 @@ func (t *gdbThread) writeRegisters() error {
 		} else {
 			return err
 		}
-
 	}
-	for _, r := range t.regs.regs {
-		if r.ignoreOnWrite {
+	for i, reginfo := range t.regs.regsInfo {
+		r := t.regs.regs[reginfo.Name]
+		if r.ignoreOnWrite || !t.regs.loaded[i] {
 			continue
 		}
 		if err := t.p.conn.writeRegister(t.strID, r.regnum, r.value); err != nil {
@@ -1909,6 +1955,8 @@ func (t *gdbThread) reloadGAlloc() error {
 
 func (t *gdbThread) clearBreakpointState() {
 	t.setbp = false
+	t.watchAddr = 0
+	t.watchReg = -1
 	t.CurrentBreakpoint.Clear()
 }
 
@@ -1917,12 +1965,35 @@ func (t *gdbThread) SetCurrentBreakpoint(adjustPC bool) error {
 	// adjustPC is ignored, it is the stub's responsibility to set the PC
 	// address correctly after hitting a breakpoint.
 	t.CurrentBreakpoint.Clear()
+	// t.watchAddr on certain mach kernel versions could contain the address of a
+	// software breakpoint, hardcoded breakpoint (e.g. runtime.Breakpoint) or a
+	// hardware watchpoint. The mach exception produced by the kernel *should* disambiguate
+	// but it doesn't.
 	if t.watchAddr > 0 {
 		t.CurrentBreakpoint.Breakpoint = t.p.Breakpoints().M[t.watchAddr]
 		if t.CurrentBreakpoint.Breakpoint == nil {
+			buf := make([]byte, t.BinInfo().Arch.BreakpointSize())
+			_, err := t.p.ReadMemory(buf, t.watchAddr)
+			isHardcodedBreakpoint := err == nil && (bytes.Equal(t.BinInfo().Arch.BreakpointInstruction(), buf) || bytes.Equal(t.BinInfo().Arch.AltBreakpointInstruction(), buf))
+			if isHardcodedBreakpoint {
+				// This is a hardcoded breakpoint, ignore.
+				// TODO(deparker): There's an optimization here since we will do this
+				// again at a higher level to determine if we've stopped at a hardcoded breakpoint.
+				// We could set some state here so that we don't do extra work later.
+				t.watchAddr = 0
+				return nil
+			}
 			return fmt.Errorf("could not find watchpoint at address %#x", t.watchAddr)
 		}
 		return nil
+	}
+	if t.watchReg >= 0 {
+		for _, bp := range t.p.Breakpoints().M {
+			if bp.WatchType != 0 && bp.HWBreakIndex == uint8(t.watchReg) {
+				t.CurrentBreakpoint.Breakpoint = bp
+				return nil
+			}
+		}
 	}
 	regs, err := t.Registers()
 	if err != nil {
@@ -2139,6 +2210,7 @@ func (regs *gdbRegisters) Copy() (proc.Registers, error) {
 	savedRegs := &gdbRegisters{}
 	savedRegs.init(regs.regsInfo, regs.arch, regs.regnames)
 	copy(savedRegs.buf, regs.buf)
+	copy(savedRegs.loaded, regs.loaded)
 	return savedRegs, nil
 }
 
@@ -2161,6 +2233,28 @@ func machTargetExcToError(sig uint8) error {
 		return errors.New("software exception")
 	case 0x96:
 		return errors.New("breakpoint exception")
+	}
+	return nil
+}
+
+func checkRosettaExpensive() error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	if runtime.GOARCH != "arm64" {
+		return nil
+	}
+
+	// Additionally check the output of 'uname -m' if it's x86_64 it means that
+	// the shell we are running on is being emulated by Rosetta even though our
+	// process isn't. In this condition debugserver will crash.
+	out, err := exec.Command("uname", "-m").Output()
+	if err != nil {
+		return nil
+	}
+	s := strings.TrimSpace(string(out))
+	if s == "x86_64" {
+		return errors.New("can not run under Rosetta, check that the terminal/shell in use is right for your CPU architecture")
 	}
 	return nil
 }
