@@ -127,7 +127,7 @@ type CommandOut struct {
 
 // Command interrupts, continues and steps through the program.
 func (s *RPCServer) Command(command api.DebuggerCommand, cb service.RPCCallback) {
-	st, err := s.debugger.Command(&command, cb.SetupDoneChan())
+	st, err := s.debugger.Command(&command, cb.SetupDoneChan(), cb.DisconnectChan())
 	if err != nil {
 		cb.Return(nil, err)
 		return
@@ -201,7 +201,6 @@ func (s *RPCServer) Stacktrace(arg StacktraceIn, out *StacktraceOut) error {
 	if arg.Defers {
 		arg.Opts |= api.StacktraceReadDefers
 	}
-	var err error
 	rawlocs, err := s.debugger.Stacktrace(arg.Id, arg.Depth, arg.Opts)
 	if err != nil {
 		return err
@@ -390,8 +389,8 @@ func (s *RPCServer) ListThreads(arg ListThreadsIn, out *ListThreadsOut) (err err
 	if err != nil {
 		return err
 	}
-	s.debugger.LockTarget()
-	defer s.debugger.UnlockTarget()
+	_, unlock := s.debugger.LockTargetGroup()
+	defer unlock()
 	out.Threads = api.ConvertThreads(threads, s.debugger.ConvertThreadBreakpoint)
 	return nil
 }
@@ -413,8 +412,8 @@ func (s *RPCServer) GetThread(arg GetThreadIn, out *GetThreadOut) error {
 	if t == nil {
 		return fmt.Errorf("no thread with id %d", arg.Id)
 	}
-	s.debugger.LockTarget()
-	defer s.debugger.UnlockTarget()
+	_, unlock := s.debugger.LockTargetGroup()
+	defer unlock()
 	out.Thread = api.ConvertThread(t, s.debugger.ConvertThreadBreakpoint(t))
 	return nil
 }
@@ -462,17 +461,18 @@ func (s *RPCServer) ListRegisters(arg ListRegistersIn, out *ListRegistersOut) er
 	}
 
 	var regs *op.DwarfRegisters
+	var dwarfRegisterToString proc.DwarfRegisterToStringFunc
 	var err error
 
 	if arg.Scope != nil {
-		regs, err = s.debugger.ScopeRegisters(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall)
+		regs, dwarfRegisterToString, err = s.debugger.ScopeRegisters(arg.Scope.GoroutineID, arg.Scope.Frame, arg.Scope.DeferredCall)
 	} else {
-		regs, err = s.debugger.ThreadRegisters(arg.ThreadID)
+		regs, dwarfRegisterToString, err = s.debugger.ThreadRegisters(arg.ThreadID)
 	}
 	if err != nil {
 		return err
 	}
-	out.Regs = api.ConvertRegisters(regs, s.debugger.DwarfRegisterToString, arg.IncludeFp)
+	out.Regs = api.ConvertRegisters(regs, dwarfRegisterToString, arg.IncludeFp)
 	out.Registers = out.Regs.String()
 
 	return nil
@@ -578,7 +578,8 @@ func (s *RPCServer) ListSources(arg ListSourcesIn, out *ListSourcesOut) error {
 }
 
 type ListFunctionsIn struct {
-	Filter string
+	Filter      string
+	FollowCalls int
 }
 
 type ListFunctionsOut struct {
@@ -587,7 +588,7 @@ type ListFunctionsOut struct {
 
 // ListFunctions lists all functions in the process matching filter.
 func (s *RPCServer) ListFunctions(arg ListFunctionsIn, out *ListFunctionsOut) error {
-	fns, err := s.debugger.Functions(arg.Filter)
+	fns, err := s.debugger.Functions(arg.Filter, arg.FollowCalls)
 	if err != nil {
 		return err
 	}
@@ -703,9 +704,9 @@ func (s *RPCServer) ListGoroutines(arg ListGoroutinesIn, out *ListGoroutinesOut)
 	}
 	gs = s.debugger.FilterGoroutines(gs, arg.Filters)
 	gs, out.Groups, out.TooManyGroups = s.debugger.GroupGoroutines(gs, &arg.GoroutineGroupingOptions)
-	s.debugger.LockTarget()
-	defer s.debugger.UnlockTarget()
-	out.Goroutines = api.ConvertGoroutines(s.debugger.Target(), gs)
+	tgrp, unlock := s.debugger.LockTargetGroup()
+	defer unlock()
+	out.Goroutines = api.ConvertGoroutines(tgrp.Selected, gs)
 	out.Nextg = nextg
 	return nil
 }
@@ -780,7 +781,6 @@ type DisassembleOut struct {
 //
 // Disassemble will also try to calculate the destination address of an absolute indirect CALL if it happens to be the instruction the selected goroutine is stopped at.
 func (s *RPCServer) Disassemble(arg DisassembleIn, out *DisassembleOut) error {
-	var err error
 	insts, err := s.debugger.Disassemble(arg.Scope.GoroutineID, arg.StartPC, arg.EndPC)
 	if err != nil {
 		return err
@@ -827,7 +827,6 @@ type ListCheckpointsOut struct {
 }
 
 func (s *RPCServer) ListCheckpoints(arg ListCheckpointsIn, out *ListCheckpointsOut) error {
-	var err error
 	cps, err := s.debugger.Checkpoints()
 	if err != nil {
 		return err
@@ -976,9 +975,11 @@ type ExaminedMemoryOut struct {
 	IsLittleEndian bool
 }
 
+const ExamineMemoryLengthLimit = 1 << 16
+
 func (s *RPCServer) ExamineMemory(arg ExamineMemoryIn, out *ExaminedMemoryOut) error {
-	if arg.Length > 1000 {
-		return fmt.Errorf("len must be less than or equal to 1000")
+	if arg.Length > ExamineMemoryLengthLimit {
+		return fmt.Errorf("len must be less than or equal to %d", ExamineMemoryLengthLimit)
 	}
 	Mem, err := s.debugger.ExamineMemory(arg.Address, arg.Length)
 	if err != nil {
@@ -1090,10 +1091,10 @@ type ListTargetsOut struct {
 
 // ListTargets returns the list of targets we are currently attached to.
 func (s *RPCServer) ListTargets(arg ListTargetsIn, out *ListTargetsOut) error {
-	s.debugger.LockTarget()
-	defer s.debugger.UnlockTarget()
+	tgrp, unlock := s.debugger.LockTargetGroup()
+	defer unlock()
 	out.Targets = []api.Target{}
-	for _, tgt := range s.debugger.TargetGroup().Targets() {
+	for _, tgt := range tgrp.Targets() {
 		if _, err := tgt.Valid(); err == nil {
 			out.Targets = append(out.Targets, *api.ConvertTarget(tgt, s.debugger.ConvertThreadBreakpoint))
 		}
@@ -1141,5 +1142,21 @@ func (s *RPCServer) DebugInfoDirectories(arg DebugInfoDirectoriesIn, out *DebugI
 		s.debugger.SetDebugInfoDirectories(arg.List)
 	}
 	out.List = s.debugger.DebugInfoDirectories()
+	return nil
+}
+
+type GuessSubstitutePathIn struct {
+	Args api.GuessSubstitutePathIn
+}
+
+type GuessSubstitutePathOut struct {
+	List [][2]string
+}
+
+func (s *RPCServer) GuessSubstitutePath(arg GuessSubstitutePathIn, out *GuessSubstitutePathOut) error {
+	m := s.debugger.GuessSubstitutePath(&arg.Args)
+	for k, v := range m {
+		out.List = append(out.List, [2]string{k, v})
+	}
 	return nil
 }

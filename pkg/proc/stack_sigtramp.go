@@ -18,7 +18,7 @@ func (it *stackIterator) readSigtrampgoContext() (*op.DwarfRegisters, error) {
 	bi := it.bi
 
 	findvar := func(name string) *Variable {
-		vars, _ := scope.Locals(0)
+		vars, _ := scope.Locals(0, name)
 		for i := range vars {
 			if vars[i].Name == name {
 				return vars[i]
@@ -429,7 +429,6 @@ func sigtrampContextFromExceptionPointers(mem MemoryReader, addr uint64) (uint64
 		return 0, err
 	}
 	return ((*exceptionpointers)(unsafe.Pointer(&buf[0]))).context, nil
-
 }
 
 func sigtrampContextWindowsAMD64(mem MemoryReader, addr uint64) (*op.DwarfRegisters, error) {

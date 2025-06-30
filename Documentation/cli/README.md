@@ -13,6 +13,7 @@ Command | Description
 [call](#call) | Resumes process, injecting a function call (EXPERIMENTAL!!!)
 [continue](#continue) | Run until breakpoint or program termination.
 [next](#next) | Step over to next source line.
+[next-instruction](#next-instruction) | Single step a single cpu instruction, skipping function calls.
 [rebuild](#rebuild) | Rebuild the target executable and restarts it. It does not work if the executable was not built by delve.
 [restart](#restart) | Restart process.
 [rev](#rev) | Reverses the execution of the target program for the command specified.
@@ -107,9 +108,32 @@ If regex is specified only function arguments with a name matching it will be re
 ## break
 Sets a breakpoint.
 
-	break [name] [locspec]
+	break [name] [locspec] [if <condition>]
 
-See [Documentation/cli/locspec.md](//github.com/go-delve/delve/tree/master/Documentation/cli/locspec.md) for the syntax of locspec. If locspec is omitted a breakpoint will be set on the current line.
+Locspec is a location specifier in the form of:
+
+  * *&lt;address> Specifies the location of memory address address. address can be specified as a decimal, hexadecimal or octal number
+  * &lt;filename>:&lt;line> Specifies the line in filename. filename can be the partial path to a file or even just the base name as long as the expression remains unambiguous.
+  * &lt;line> Specifies the line in the current file
+  * +&lt;offset> Specifies the line offset lines after the current one
+  * -&lt;offset> Specifies the line offset lines before the current one
+  * &lt;function>[:&lt;line>] Specifies the line inside function.
+      The full syntax for function is &lt;package>.(*&lt;receiver type>).&lt;function name> however the only required element is the function name,
+      everything else can be omitted as long as the expression remains unambiguous. For setting a breakpoint on an init function (ex: main.init),
+      the &lt;filename>:&lt;line> syntax should be used to break in the correct init function at the correct location.
+  * /&lt;regex>/ Specifies the location of all the functions matching regex
+
+If locspec is omitted a breakpoint will be set on the current line.
+
+If you would like to assign a name to the breakpoint you can do so with the form:
+
+	break mybpname main.go:4
+
+Finally, you can assign a condition to the newly created breakpoint by using the 'if' postfix form, like so:
+
+	break main.go:55 if i == 5
+
+Alternatively you can set a condition on a breakpoint after created by using the 'on' command.
 
 See also: "help on", "help cond" and "help clear"
 
@@ -187,7 +211,7 @@ Set breakpoint condition.
 
 Specifies that the breakpoint, tracepoint or watchpoint should break only if the boolean expression is true.
 
-See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions.
+See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions and [Documentation/cli/cond.md](//github.com/go-delve/delve/tree/master/Documentation/cli/cond.md) for a description of how breakpoint conditions are evaluated.
 
 With the -hitcount option a condition on the breakpoint hit count can be set, the following operators are supported
 
@@ -232,16 +256,19 @@ Changes the value of a configuration parameter.
 	config substitute-path <from> <to>
 	config substitute-path <from>
 	config substitute-path -clear
+	config substitute-path -guess
 
 Adds or removes a path substitution rule, if -clear is used all
 substitute-path rules are removed. Without arguments shows the current list
 of substitute-path rules.
+The -guess option causes Delve to try to guess your substitute-path
+configuration automatically.
 See also [Documentation/cli/substitutepath.md](//github.com/go-delve/delve/tree/master/Documentation/cli/substitutepath.md) for how the rules are applied.
 
 	config alias <command> <alias>
 	config alias <alias>
 
-Defines <alias> as an alias to <command> or removes an alias.
+Defines &lt;alias> as an alias to &lt;command> or removes an alias.
 
 	config debug-info-directories -add <path>
 	config debug-info-directories -rm <path>
@@ -302,7 +329,7 @@ Move the current frame down.
 	down [<m>]
 	down [<m>] <command>
 
-Move the current frame down by <m>. The second form runs the command on the given frame.
+Move the current frame down by &lt;m>. The second form runs the command on the given frame.
 
 
 ## dump
@@ -330,7 +357,7 @@ Examine memory:
 	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] <address>
 	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] -x <expression>
 
-Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal).
+Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal) and raw.
 Length is the number of bytes (default 1) and must be less than or equal to 1000.
 Address is the memory location of the target to examine. Please note '-len' is deprecated by '-count and -size'.
 Expression can be an integer expression or pointer value of the memory location to examine.
@@ -456,7 +483,7 @@ GROUPING
 	goloc: groups goroutines by the location of the go instruction that created the goroutine
 	startloc: groups goroutines by the location of the start function
 	running: groups goroutines by whether they are running or not
-	user: groups goroutines by weather they are user or runtime goroutines
+	user: groups goroutines by whether they are user or runtime goroutines
 
 
 Groups goroutines by the given location, running status or user classification, up to 5 goroutines per group will be displayed as well as the total number of goroutines in the group.
@@ -523,6 +550,11 @@ Optional [count] argument allows you to skip multiple lines.
 
 Aliases: n
 
+## next-instruction
+Single step a single cpu instruction, skipping function calls.
+
+Aliases: ni nexti
+
 ## on
 Executes a command when a breakpoint is hit.
 
@@ -535,7 +567,7 @@ To convert a breakpoint into a tracepoint use:
 	
 	on <breakpoint name or id> trace
 
-The command 'on <bp> cond <cond-arguments>' is equivalent to 'cond <bp> <cond-arguments>'.
+The command 'on &lt;bp> cond &lt;cond-arguments>' is equivalent to 'cond &lt;bp> &lt;cond-arguments>'.
 
 The command 'on x -edit' can be used to edit the list of commands executed when the breakpoint is hit.
 
@@ -658,7 +690,7 @@ Aliases: s
 ## step-instruction
 Single step a single cpu instruction.
 
-Aliases: si
+Aliases: si stepi
 
 ## stepout
 Step out of the current function.
@@ -695,7 +727,7 @@ Print out info for every traced thread.
 ## toggle
 Toggles on or off a breakpoint.
 
-toggle <breakpoint name or id>
+	toggle <breakpoint name or id>
 
 
 ## trace
@@ -734,7 +766,7 @@ Move the current frame up.
 	up [<m>]
 	up [<m>] <command>
 
-Move the current frame up by <m>. The second form runs the command on the given frame.
+Move the current frame up by &lt;m>. The second form runs the command on the given frame.
 
 
 ## vars

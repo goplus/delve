@@ -260,6 +260,7 @@ func (t *Target) SupportsFunctionCalls() bool {
 func (t *Target) ClearCaches() {
 	t.clearFakeMemory()
 	t.gcache.Clear()
+	t.BinInfo().moduleDataCache = nil
 	for _, thread := range t.ThreadList() {
 		thread.Common().g = nil
 	}
@@ -355,7 +356,7 @@ func setAsyncPreemptOff(p *Target, v int64) {
 	p.asyncPreemptChanged = true
 	p.asyncPreemptOff, _ = constant.Int64Val(asyncpreemptoffv.Value)
 
-	err = scope.setValue(asyncpreemptoffv, newConstant(constant.MakeInt64(v), scope.Mem), "")
+	err = scope.setValue(asyncpreemptoffv, newConstant(constant.MakeInt64(v), scope.BinInfo, scope.Mem), "")
 	if err != nil {
 		logger.Warnf("could not set asyncpreemptoff %v", err)
 	}

@@ -1,19 +1,24 @@
 package proc
 
 import (
+	"bytes"
 	"debug/dwarf"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/constant"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"reflect"
+	"strconv"
 
+	"github.com/go-delve/delve/pkg/astutil"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
 	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/proc/evalop"
 	"github.com/go-delve/delve/pkg/proc/internal/ebpf"
 )
 
@@ -63,6 +68,11 @@ type Breakpoint struct {
 	// ReturnInfo describes how to collect return variables when this
 	// breakpoint is hit as a return breakpoint.
 	returnInfo *returnBreakpointInfo
+
+	// RootFuncName is the name of the root function from where tracing needs to be done
+	RootFuncName string
+	// TraceFollowCalls indicates the depth of tracing
+	TraceFollowCalls int
 }
 
 // Breaklet represents one of multiple breakpoints that can overlap on a
@@ -135,7 +145,16 @@ const (
 	// been loaded and we should try to enable suspended breakpoints.
 	PluginOpenBreakpoint
 
-	steppingMask = NextBreakpoint | NextDeferBreakpoint | StepBreakpoint
+	// StepIntoNewProc is a breakpoint used to step into a newly created
+	// goroutine.
+	StepIntoNewProcBreakpoint
+
+	// NextInactivatedBreakpoint a NextBreakpoint that has been inactivated, see rangeFrameInactivateNextBreakpoints
+	NextInactivatedBreakpoint
+
+	StepIntoRangeOverFuncBodyBreakpoint
+
+	steppingMask = NextBreakpoint | NextDeferBreakpoint | StepBreakpoint | StepIntoNewProcBreakpoint | NextInactivatedBreakpoint | StepIntoRangeOverFuncBodyBreakpoint
 )
 
 // WatchType is the watchpoint type
@@ -197,19 +216,25 @@ func (bp *Breakpoint) VerboseDescr() []string {
 	for _, breaklet := range bp.Breaklets {
 		switch breaklet.Kind {
 		case UserBreakpoint:
-			r = append(r, fmt.Sprintf("User Cond=%q HitCond=%v", exprToString(breaklet.Cond), lbp.HitCond))
+			r = append(r, fmt.Sprintf("User Cond=%q HitCond=%v", astutil.ExprToString(breaklet.Cond), lbp.HitCond()))
 		case NextBreakpoint:
-			r = append(r, fmt.Sprintf("Next Cond=%q", exprToString(breaklet.Cond)))
+			r = append(r, fmt.Sprintf("Next Cond=%q", astutil.ExprToString(breaklet.Cond)))
 		case NextDeferBreakpoint:
-			r = append(r, fmt.Sprintf("NextDefer Cond=%q DeferReturns=%#x", exprToString(breaklet.Cond), breaklet.DeferReturns))
+			r = append(r, fmt.Sprintf("NextDefer Cond=%q DeferReturns=%#x", astutil.ExprToString(breaklet.Cond), breaklet.DeferReturns))
 		case StepBreakpoint:
-			r = append(r, fmt.Sprintf("Step Cond=%q", exprToString(breaklet.Cond)))
+			r = append(r, fmt.Sprintf("Step Cond=%q", astutil.ExprToString(breaklet.Cond)))
 		case WatchOutOfScopeBreakpoint:
-			r = append(r, fmt.Sprintf("WatchOutOfScope Cond=%q checkPanicCall=%v", exprToString(breaklet.Cond), breaklet.checkPanicCall))
+			r = append(r, fmt.Sprintf("WatchOutOfScope Cond=%q checkPanicCall=%v", astutil.ExprToString(breaklet.Cond), breaklet.checkPanicCall))
 		case StackResizeBreakpoint:
-			r = append(r, fmt.Sprintf("StackResizeBreakpoint Cond=%q", exprToString(breaklet.Cond)))
+			r = append(r, fmt.Sprintf("StackResizeBreakpoint Cond=%q", astutil.ExprToString(breaklet.Cond)))
 		case PluginOpenBreakpoint:
 			r = append(r, "PluginOpenBreakpoint")
+		case StepIntoNewProcBreakpoint:
+			r = append(r, "StepIntoNewProcBreakpoint")
+		case NextInactivatedBreakpoint:
+			r = append(r, "NextInactivatedBreakpoint")
+		case StepIntoRangeOverFuncBodyBreakpoint:
+			r = append(r, "StepIntoRangeOverFuncBodyBreakpoint Cond=%q", astutil.ExprToString(breaklet.Cond))
 		default:
 			r = append(r, fmt.Sprintf("Unknown %d", breaklet.Kind))
 		}
@@ -284,7 +309,6 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
 	case StepBreakpoint, NextBreakpoint, NextDeferBreakpoint:
 		nextDeferOk := true
 		if breaklet.Kind&NextDeferBreakpoint != 0 {
-			var err error
 			frames, err := ThreadStacktrace(tgt, thread, 2)
 			if err == nil {
 				nextDeferOk, _ = isPanicCall(frames)
@@ -304,8 +328,11 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
 			}
 		}
 
-	case StackResizeBreakpoint, PluginOpenBreakpoint:
+	case StackResizeBreakpoint, PluginOpenBreakpoint, StepIntoNewProcBreakpoint, StepIntoRangeOverFuncBodyBreakpoint:
 		// no further checks
+
+	case NextInactivatedBreakpoint:
+		active = false
 
 	default:
 		bpstate.CondError = fmt.Errorf("internal error unknown breakpoint kind %v", breaklet.Kind)
@@ -329,13 +356,16 @@ func (bpstate *BreakpointState) checkCond(tgt *Target, breaklet *Breaklet, threa
 		case StepBreakpoint:
 			bpstate.Stepping = true
 			bpstate.SteppingInto = true
+		case StepIntoRangeOverFuncBodyBreakpoint:
+			bpstate.Stepping = true
+			bpstate.SteppingIntoRangeOverFuncBody = true
 		}
 	}
 }
 
 // checkHitCond evaluates bp's hit condition on thread.
 func checkHitCond(lbp *LogicalBreakpoint, goroutineID int64) bool {
-	if lbp == nil || lbp.HitCond == nil {
+	if lbp == nil || lbp.hitCond == nil {
 		return true
 	}
 	hitCount := int(lbp.TotalHitCount)
@@ -343,21 +373,21 @@ func checkHitCond(lbp *LogicalBreakpoint, goroutineID int64) bool {
 		hitCount = int(lbp.HitCount[goroutineID])
 	}
 	// Evaluate the breakpoint condition.
-	switch lbp.HitCond.Op {
+	switch lbp.hitCond.Op {
 	case token.EQL:
-		return hitCount == lbp.HitCond.Val
+		return hitCount == lbp.hitCond.Val
 	case token.NEQ:
-		return hitCount != lbp.HitCond.Val
+		return hitCount != lbp.hitCond.Val
 	case token.GTR:
-		return hitCount > lbp.HitCond.Val
+		return hitCount > lbp.hitCond.Val
 	case token.LSS:
-		return hitCount < lbp.HitCond.Val
+		return hitCount < lbp.hitCond.Val
 	case token.GEQ:
-		return hitCount >= lbp.HitCond.Val
+		return hitCount >= lbp.hitCond.Val
 	case token.LEQ:
-		return hitCount <= lbp.HitCond.Val
+		return hitCount <= lbp.hitCond.Val
 	case token.REM:
-		return hitCount%lbp.HitCond.Val == 0
+		return hitCount%lbp.hitCond.Val == 0
 	}
 	return false
 }
@@ -616,11 +646,28 @@ func (t *Target) SetWatchpoint(logicalID int, scope *EvalScope, expr string, wty
 	if xv.Kind == reflect.UnsafePointer || xv.Kind == reflect.Invalid {
 		return nil, fmt.Errorf("can not watch variable of type %s", xv.Kind.String())
 	}
+
+	// Special handling for interface types
+	if xv.Kind == reflect.Interface {
+		// For interfaces, we want to watch the data they point to
+		// Read the interface to get the data pointer
+		_, data, _ := xv.readInterface()
+		if xv.Unreadable != nil {
+			return nil, fmt.Errorf("error reading interface %q: %v", expr, xv.Unreadable)
+		}
+		if data == nil {
+			return nil, fmt.Errorf("invalid interface %q", expr)
+		}
+
+		// Use the data field as our watch target
+		xv = data
+		expr = expr + " (interface data)"
+	}
+
 	sz := xv.DwarfType.Size()
 	if sz <= 0 || sz > int64(t.BinInfo().Arch.PtrSize()) {
 		//TODO(aarzilli): it is reasonable to expect to be able to watch string
-		//and interface variables and we could support it by watching certain
-		//member fields here.
+		//variables and we could support it by watching certain member fields here.
 		return nil, fmt.Errorf("can not watch variable of type %s", xv.DwarfType.String())
 	}
 
@@ -674,13 +721,14 @@ func (t *Target) setBreakpointInternal(logicalID int, addr uint64, kind Breakpoi
 		if lbp == nil {
 			lbp = &LogicalBreakpoint{LogicalID: logicalID}
 			lbp.HitCount = make(map[int64]uint64)
-			lbp.Enabled = true
+			lbp.enabled = true
+			lbp.condSatisfiable = true
 			bpmap.Logical[logicalID] = lbp
 		}
 		bp.Logical = lbp
 		breaklet := bp.UserBreaklet()
 		if breaklet != nil && breaklet.Cond == nil {
-			breaklet.Cond = lbp.Cond
+			breaklet.Cond = lbp.cond
 		}
 		if lbp.File == "" && lbp.Line == 0 {
 			lbp.File = bp.File
@@ -823,6 +871,29 @@ func (t *Target) ClearSteppingBreakpoints() error {
 	return nil
 }
 
+func (t *Target) clearInactivatedSteppingBreakpoint() error {
+	threads := t.ThreadList()
+	for _, bp := range t.Breakpoints().M {
+		for i := range bp.Breaklets {
+			if bp.Breaklets[i].Kind == NextInactivatedBreakpoint {
+				bp.Breaklets[i] = nil
+			}
+		}
+		cleared, err := t.finishClearBreakpoint(bp)
+		if err != nil {
+			return err
+		}
+		if cleared {
+			for _, thread := range threads {
+				if thread.Breakpoint().Breakpoint == bp {
+					thread.Breakpoint().Clear()
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // finishClearBreakpoint clears nil breaklets from the breaklet list of bp
 // and if it is empty erases the breakpoint.
 // Returns true if the breakpoint was deleted
@@ -869,6 +940,24 @@ func (bpmap *BreakpointMap) HasHWBreakpoints() bool {
 	return false
 }
 
+func totalHitCountByName(lbpmap map[int]*LogicalBreakpoint, s string) (uint64, error) {
+	for _, bp := range lbpmap {
+		if bp.Name == s {
+			return bp.TotalHitCount, nil
+		}
+	}
+	return 0, fmt.Errorf("could not find breakpoint named %q", s)
+}
+
+func totalHitCountByID(lbpmap map[int]*LogicalBreakpoint, id int) (uint64, error) {
+	for _, bp := range lbpmap {
+		if bp.LogicalID == int(id) {
+			return bp.TotalHitCount, nil
+		}
+	}
+	return 0, fmt.Errorf("could not find breakpoint with ID = %d", id)
+}
+
 // BreakpointState describes the state of a breakpoint in a thread.
 type BreakpointState struct {
 	*Breakpoint
@@ -879,7 +968,8 @@ type BreakpointState struct {
 	Stepping bool
 	// SteppingInto is true if one of the active stepping breaklets has Kind ==
 	// StepBreakpoint.
-	SteppingInto bool
+	SteppingInto                  bool
+	SteppingIntoRangeOverFuncBody bool
 	// CondError contains any error encountered while evaluating the
 	// breakpoint's condition.
 	CondError error
@@ -924,11 +1014,11 @@ func (rbpi *returnBreakpointInfo) Collect(t *Target, thread Thread) []*Variable 
 
 	g, err := GetG(thread)
 	if err != nil {
-		return returnInfoError("could not get g", err, thread.ProcessMemory())
+		return returnInfoError("could not get g", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 	scope, err := GoroutineScope(t, thread)
 	if err != nil {
-		return returnInfoError("could not get scope", err, thread.ProcessMemory())
+		return returnInfoError("could not get scope", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 	v, err := scope.evalAST(rbpi.retFrameCond)
 	if err != nil || v.Unreadable != nil || v.Kind != reflect.Bool {
@@ -946,12 +1036,12 @@ func (rbpi *returnBreakpointInfo) Collect(t *Target, thread Thread) []*Variable 
 	oldSP := uint64(rbpi.spOffset + int64(g.stack.hi))
 	err = fakeFunctionEntryScope(scope, rbpi.fn, oldFrameOffset, oldSP)
 	if err != nil {
-		return returnInfoError("could not read function entry", err, thread.ProcessMemory())
+		return returnInfoError("could not read function entry", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 
-	vars, err := scope.Locals(0)
+	vars, err := scope.Locals(0, "")
 	if err != nil {
-		return returnInfoError("could not evaluate return variables", err, thread.ProcessMemory())
+		return returnInfoError("could not evaluate return variables", err, thread.BinInfo(), thread.ProcessMemory())
 	}
 	vars = filterVariables(vars, func(v *Variable) bool {
 		return (v.Flags & VariableReturnArgument) != 0
@@ -960,8 +1050,8 @@ func (rbpi *returnBreakpointInfo) Collect(t *Target, thread Thread) []*Variable 
 	return vars
 }
 
-func returnInfoError(descr string, err error, mem MemoryReadWriter) []*Variable {
-	v := newConstant(constant.MakeString(fmt.Sprintf("%s: %v", descr, err.Error())), mem)
+func returnInfoError(descr string, err error, bi *BinaryInfo, mem MemoryReadWriter) []*Variable {
+	v := newConstant(constant.MakeString(fmt.Sprintf("%s: %v", descr, err.Error())), bi, mem)
 	v.Name = "return value read error"
 	return []*Variable{v}
 }
@@ -983,7 +1073,7 @@ type LogicalBreakpoint struct {
 	FunctionName string
 	File         string
 	Line         int
-	Enabled      bool
+	enabled      bool
 
 	Set SetBreakpoint
 
@@ -999,17 +1089,26 @@ type LogicalBreakpoint struct {
 	TotalHitCount uint64           // Number of times a breakpoint has been reached
 	HitCondPerG   bool             // Use per goroutine hitcount as HitCond operand, instead of total hitcount
 
-	// HitCond: if not nil the breakpoint will be triggered only if the evaluated HitCond returns
+	// hitCond: if not nil the breakpoint will be triggered only if the evaluated HitCond returns
 	// true with the TotalHitCount.
-	HitCond *struct {
+	hitCond *struct {
 		Op  token.Token
 		Val int
 	}
 
-	// Cond: if not nil the breakpoint will be triggered only if evaluating Cond returns true
-	Cond ast.Expr
+	// cond: if not nil the breakpoint will be triggered only if evaluating Cond returns true
+	cond ast.Expr
+
+	// condSatisfiable is true when 'cond && hitCond' can potentially be true.
+	condSatisfiable bool
+	// condUsesHitCounts is true when 'cond' uses breakpoint hitcounts
+	condUsesHitCounts bool
 
 	UserData interface{} // Any additional information about the breakpoint
+	// Name of root function from where tracing needs to be done
+	RootFuncName string
+	// depth of tracing
+	TraceFollowCalls int
 }
 
 // SetBreakpoint describes how a breakpoint should be set.
@@ -1025,4 +1124,156 @@ type SetBreakpoint struct {
 type PidAddr struct {
 	Pid  int
 	Addr uint64
+}
+
+// Enabled returns true if the breakpoint is enabled.
+func (lbp *LogicalBreakpoint) Enabled() bool {
+	return lbp.enabled
+}
+
+// HitCond returns the hit condition.
+func (lbp *LogicalBreakpoint) HitCond() string {
+	if lbp.hitCond == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s %d", lbp.hitCond.Op.String(), lbp.hitCond.Val)
+}
+
+func (lbp *LogicalBreakpoint) Cond() string {
+	var buf bytes.Buffer
+	printer.Fprint(&buf, token.NewFileSet(), lbp.cond)
+	return buf.String()
+}
+
+func breakpointConditionSatisfiable(lbpmap map[int]*LogicalBreakpoint, lbp *LogicalBreakpoint) bool {
+	if lbp.hitCond != nil && !lbp.HitCondPerG {
+		switch lbp.hitCond.Op {
+		case token.EQL, token.LEQ:
+			if int(lbp.TotalHitCount) >= lbp.hitCond.Val {
+				return false
+			}
+		case token.LSS:
+			if int(lbp.TotalHitCount) >= lbp.hitCond.Val-1 {
+				return false
+			}
+		}
+	}
+	if !lbp.condUsesHitCounts {
+		return true
+	}
+
+	toint := func(x ast.Expr) (uint64, bool) {
+		lit, ok := x.(*ast.BasicLit)
+		if !ok || lit.Kind != token.INT {
+			return 0, false
+		}
+		n, err := strconv.Atoi(lit.Value)
+		return uint64(n), err == nil && n >= 0
+	}
+
+	hitcountexpr := func(x ast.Expr) (uint64, bool) {
+		idx, ok := x.(*ast.IndexExpr)
+		if !ok {
+			return 0, false
+		}
+		selx, ok := idx.X.(*ast.SelectorExpr)
+		if !ok {
+			return 0, false
+		}
+		ident, ok := selx.X.(*ast.Ident)
+		if !ok || ident.Name != evalop.BreakpointHitCountVarNamePackage || selx.Sel.Name != evalop.BreakpointHitCountVarName {
+			return 0, false
+		}
+		lit, ok := idx.Index.(*ast.BasicLit)
+		if !ok {
+			return 0, false
+		}
+		switch lit.Kind {
+		case token.INT:
+			n, _ := strconv.Atoi(lit.Value)
+			thc, err := totalHitCountByID(lbpmap, n)
+			return thc, err == nil
+		case token.STRING:
+			v, _ := strconv.Unquote(lit.Value)
+			thc, err := totalHitCountByName(lbpmap, v)
+			return thc, err == nil
+		default:
+			return 0, false
+		}
+	}
+
+	var satisf func(n ast.Node) bool
+	satisf = func(n ast.Node) bool {
+		parexpr, ok := n.(*ast.ParenExpr)
+		if ok {
+			return satisf(parexpr.X)
+		}
+		binexpr, ok := n.(*ast.BinaryExpr)
+		if !ok {
+			return true
+		}
+		switch binexpr.Op {
+		case token.AND:
+			return satisf(binexpr.X) && satisf(binexpr.Y)
+		case token.OR:
+			if !satisf(binexpr.X) {
+				return false
+			}
+			if !satisf(binexpr.Y) {
+				return false
+			}
+			return true
+		case token.EQL, token.LEQ, token.LSS, token.NEQ, token.GTR, token.GEQ:
+		default:
+			return true
+		}
+
+		hitcount, ok1 := hitcountexpr(binexpr.X)
+		val, ok2 := toint(binexpr.Y)
+		if !ok1 || !ok2 {
+			return true
+		}
+
+		switch binexpr.Op {
+		case token.EQL:
+			return hitcount == val
+		case token.LEQ:
+			return hitcount <= val
+		case token.LSS:
+			return hitcount < val
+		case token.NEQ:
+			return hitcount != val
+		case token.GTR:
+			return hitcount > val
+		case token.GEQ:
+			return hitcount >= val
+		}
+		return true
+	}
+
+	return satisf(lbp.cond)
+}
+
+func breakpointConditionUsesHitCounts(lbp *LogicalBreakpoint) bool {
+	if lbp.cond == nil {
+		return false
+	}
+	r := false
+	ast.Inspect(lbp.cond, func(n ast.Node) bool {
+		if r {
+			return false
+		}
+		seln, ok := n.(*ast.SelectorExpr)
+		if ok {
+			ident, ok := seln.X.(*ast.Ident)
+			if ok {
+				if ident.Name == evalop.BreakpointHitCountVarNamePackage && seln.Sel.Name == evalop.BreakpointHitCountVarName {
+					r = true
+					return false
+				}
+			}
+		}
+		return true
+	})
+	return r
 }

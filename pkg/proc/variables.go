@@ -2,6 +2,7 @@ package proc
 
 import (
 	"bytes"
+	"cmp"
 	"debug/dwarf"
 	"encoding/binary"
 	"errors"
@@ -11,7 +12,7 @@ import (
 	"math"
 	"math/bits"
 	"reflect"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +43,8 @@ const (
 	maxMapBucketsFactor = 100 // Maximum numbers of map buckets to read for every requested map entry when loading variables through (*EvalScope).LocalVariables and (*EvalScope).FunctionArguments.
 
 	maxGoroutineUserCurrentDepth = 30 // Maximum depth used by (*G).UserCurrent to search its location
+
+	maxGoroutinesLabelEntries = 1_000 // Maximum number of label entries for a goroutine's label map
 )
 
 type floatSpecial uint8
@@ -86,6 +89,11 @@ const (
 	VariableCPtr
 	// VariableCPURegister means this variable is a CPU register.
 	VariableCPURegister
+	// variableTrustLen means that when this variable is loaded its length
+	// should be trusted and used instead of MaxArrayValues
+	variableTrustLen
+
+	variableSaved
 )
 
 // Variable represents a variable. It contains the address, name,
@@ -251,7 +259,8 @@ func GetG(thread Thread) (*G, error) {
 	if thread.Common().g != nil {
 		return thread.Common().g, nil
 	}
-	if loc, _ := thread.Location(); loc != nil && loc.Fn != nil && loc.Fn.Name == "runtime.clone" {
+	loc, _ := ThreadLocation(thread)
+	if loc != nil && loc.Fn != nil && loc.Fn.Name == "runtime.clone" {
 		// When threads are executing runtime.clone the value of TLS is unreliable.
 		return nil, nil
 	}
@@ -290,7 +299,7 @@ func GetG(thread Thread) (*G, error) {
 		g.SystemStack = true
 	}
 	g.Thread = thread
-	if loc, err := thread.Location(); err == nil {
+	if err == nil {
 		g.CurrentLoc = *loc
 	}
 	thread.Common().g = g
@@ -348,7 +357,7 @@ func GoroutinesInfo(dbp *Target, start, count int) ([]*G, int, error) {
 			continue
 		}
 		if thg, allocated := threadg[g.ID]; allocated {
-			loc, err := thg.Thread.Location()
+			loc, err := ThreadLocation(thg.Thread)
 			if err != nil {
 				return nil, -1, err
 			}
@@ -491,7 +500,7 @@ func (g *G) Defer() *Defer {
 		return nil
 	}
 	d := &Defer{variable: dvar}
-	d.load()
+	d.load(true)
 	return d
 }
 
@@ -506,7 +515,7 @@ func (g *G) UserCurrent() Location {
 		frame := it.Frame()
 		if frame.Call.Fn != nil {
 			name := frame.Call.Fn.Name
-			if strings.Contains(name, ".") && (!strings.HasPrefix(name, "runtime.") || frame.Call.Fn.exportedRuntime()) && !strings.HasPrefix(name, "internal/") && !strings.HasPrefix(name, "runtime/internal") {
+			if strings.Contains(name, ".") && (!strings.HasPrefix(name, "runtime.") || frame.Call.Fn.exportedRuntime()) && !strings.HasPrefix(name, "internal/") && !strings.HasPrefix(name, "runtime/internal") && !strings.HasPrefix(name, "iter.") {
 				return frame.Call
 			}
 		}
@@ -564,13 +573,43 @@ func (g *G) Labels() map[string]string {
 			labelMapType, _ := g.variable.bi.findType("runtime/pprof.labelMap")
 			if labelMapType != nil {
 				labelMap := newVariable("", address.Addr, labelMapType, g.variable.bi, g.variable.mem)
-				labelMap.loadValue(loadFullValue)
 				labels = map[string]string{}
-				for i := range labelMap.Children {
-					if i%2 == 0 {
-						k := labelMap.Children[i]
-						v := labelMap.Children[i+1]
-						labels[constant.StringVal(k.Value)] = constant.StringVal(v.Value)
+				switch labelMap.Kind {
+				case reflect.Map:
+					labelMap.loadValue(loadFullValue)
+					for i := range labelMap.Children {
+						if i%2 == 0 {
+							k := labelMap.Children[i]
+							v := labelMap.Children[i+1]
+							labels[constant.StringVal(k.Value)] = constant.StringVal(v.Value)
+						}
+					}
+				case reflect.Struct:
+					labelMap, _ = labelMap.structMember("list")
+					if labelMap != nil {
+						// ensure the labelMap.Len is a valid value to prevent infinite loops
+						if labelMap.Len < 0 {
+							labelMap.Len = 0
+						}
+						if labelMap.Len > maxGoroutinesLabelEntries {
+							labelMap.Len = maxGoroutinesLabelEntries
+						}
+						for i := int64(0); i < labelMap.Len; i++ {
+							v, err := labelMap.sliceAccess(int(i))
+							if err != nil {
+								break
+							}
+							v.loadValue(loadFullValue)
+							if len(v.Children) == 2 {
+								// Skip invalid key-value pairs caused by corrupted or incompatible label structures
+								// (e.g., labels set by some libraries: https://github.com/timandy/routine/blob/v1.1.4/goid.go#L50).
+								// This prevents panics when converting nil values via constant.StringVal().
+								if v.Children[0].Value == nil || v.Children[1].Value == nil {
+									continue
+								}
+								labels[constant.StringVal(v.Children[0].Value)] = constant.StringVal(v.Children[1].Value)
+							}
+						}
 					}
 				}
 			}
@@ -641,7 +680,7 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 		bi:        bi,
 	}
 
-	v.RealType = resolveTypedef(v.DwarfType)
+	v.RealType = godwarf.ResolveTypedef(v.DwarfType)
 
 	switch t := v.RealType.(type) {
 	case *godwarf.PtrType:
@@ -687,7 +726,7 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 		v.Kind = reflect.Array
 		v.Base = v.Addr
 		v.Len = t.Count
-		v.Cap = -1
+		v.Cap = t.Count
 		v.fieldType = t.Type
 		v.stride = 0
 
@@ -735,23 +774,10 @@ func newVariable(name string, addr uint64, dwarfType godwarf.Type, bi *BinaryInf
 	return v
 }
 
-func resolveTypedef(typ godwarf.Type) godwarf.Type {
-	for {
-		switch tt := typ.(type) {
-		case *godwarf.TypedefType:
-			typ = tt.Type
-		case *godwarf.QualType:
-			typ = tt.Type
-		default:
-			return typ
-		}
-	}
-}
-
 var constantMaxInt64 = constant.MakeInt64(1<<63 - 1)
 
-func newConstant(val constant.Value, mem MemoryReadWriter) *Variable {
-	v := &Variable{Value: val, mem: mem, loaded: true}
+func newConstant(val constant.Value, bi *BinaryInfo, mem MemoryReadWriter) *Variable {
+	v := &Variable{Value: val, mem: mem, loaded: true, bi: bi}
 	switch val.Kind() {
 	case constant.Int:
 		v.Kind = reflect.Int
@@ -927,11 +953,11 @@ func (v *Variable) parseG() (*G, error) {
 	}
 
 	status := uint64(0)
-	if atomicStatus := v.loadFieldNamed("atomicstatus"); /* +rtype uint32|runtime/internal/atomic.Uint32 */ atomicStatus != nil {
+	if atomicStatus := v.loadFieldNamed("atomicstatus"); /* +rtype uint32|runtime/internal/atomic.Uint32|internal/runtime/atomic.Uint32 */ atomicStatus != nil {
 		if constant.Val(atomicStatus.Value) != nil {
 			status, _ = constant.Uint64Val(atomicStatus.Value)
 		} else {
-			atomicStatus := atomicStatus              // +rtype runtime/internal/atomic.Uint32
+			atomicStatus := atomicStatus              // +rtype runtime/internal/atomic.Uint32|internal/runtime/atomic.Uint32
 			vv := atomicStatus.fieldVariable("value") // +rtype uint32
 			if vv == nil {
 				unreadable = true
@@ -1013,7 +1039,7 @@ func Ancestors(p *Target, g *G, n int) ([]Ancestor, error) {
 	av = av.maybeDereference()
 	av.loadValue(LoadConfig{MaxArrayValues: n, MaxVariableRecurse: 1, MaxStructFields: -1})
 	if av.Unreadable != nil {
-		return nil, err
+		return nil, av.Unreadable
 	}
 	if av.Addr == 0 {
 		// no ancestors
@@ -1088,6 +1114,9 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 		return v.clone(), nil
 	}
 	vname := v.Name
+	if v.Name == "" {
+		vname = v.DwarfType.String()
+	}
 	if v.loaded && (v.Flags&VariableFakeAddress) != 0 {
 		for i := range v.Children {
 			if v.Children[i].Name == memberName {
@@ -1096,14 +1125,28 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 		}
 		return nil, fmt.Errorf("%s has no member %s", vname, memberName)
 	}
+	closure := false
 	switch v.Kind {
 	case reflect.Chan:
 		v = v.clone()
-		v.RealType = resolveTypedef(&(v.RealType.(*godwarf.ChanType).TypedefType))
+		v.RealType = godwarf.ResolveTypedef(&(v.RealType.(*godwarf.ChanType).TypedefType))
 	case reflect.Interface:
 		v.loadInterface(0, false, LoadConfig{})
 		if len(v.Children) > 0 {
 			v = &v.Children[0]
+		}
+	case reflect.Func:
+		v.loadFunctionPtr(0, LoadConfig{MaxVariableRecurse: -1})
+		if v.Unreadable != nil {
+			return nil, v.Unreadable
+		}
+		if v.closureAddr != 0 {
+			fn := v.bi.PCToFunc(v.Base)
+			if fn != nil {
+				cst := fn.extra(v.bi).closureStructType
+				v = v.newVariable(v.Name, v.closureAddr, cst, v.mem)
+				closure = true
+			}
 		}
 	}
 
@@ -1130,6 +1173,13 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 			for _, field := range t.Field {
 				if field.Name == memberName {
 					return structVar.toField(field)
+				}
+				if len(queue) == 0 && field.Name == "&"+memberName && closure {
+					f, err := structVar.toField(field)
+					if err != nil {
+						return nil, err
+					}
+					return f.maybeDereference(), nil
 				}
 				isEmbeddedStructMember :=
 					field.Embedded ||
@@ -1166,7 +1216,7 @@ func (v *Variable) structMember(memberName string) (*Variable, error) {
 func readVarEntry(entry *godwarf.Tree, image *Image) (name string, typ godwarf.Type, err error) {
 	name, ok := entry.Val(dwarf.AttrName).(string)
 	if !ok {
-		return "", nil, fmt.Errorf("malformed variable DIE (name)")
+		return "", nil, errors.New("malformed variable DIE (name)")
 	}
 
 	typ, err = entry.Type(image.dwarf, image.index, image.typeCache)
@@ -1232,7 +1282,7 @@ func (v *Variable) maybeDereference() *Variable {
 
 	switch t := v.RealType.(type) {
 	case *godwarf.PtrType:
-		if v.Addr == 0 && len(v.Children) == 1 && v.loaded {
+		if (v.Addr == 0 || v.Flags&VariableFakeAddress != 0) && len(v.Children) == 1 && v.loaded {
 			// fake pointer variable constructed by casting an integer to a pointer type
 			return &v.Children[0]
 		}
@@ -1310,7 +1360,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 			if v.Children[0].Kind == reflect.Interface {
 				nextLvl++
 			} else if ptyp, isptr := v.RealType.(*godwarf.PtrType); isptr {
-				_, elemTypIsPtr := resolveTypedef(ptyp.Type).(*godwarf.PtrType)
+				_, elemTypIsPtr := godwarf.ResolveTypedef(ptyp.Type).(*godwarf.PtrType)
 				if elemTypIsPtr {
 					nextLvl++
 					checkLvl = true
@@ -1327,7 +1377,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 
 	case reflect.Chan:
 		sv := v.clone()
-		sv.RealType = resolveTypedef(&(sv.RealType.(*godwarf.ChanType).TypedefType))
+		sv.RealType = godwarf.ResolveTypedef(&(sv.RealType.(*godwarf.ChanType).TypedefType))
 		sv = sv.maybeDereference()
 		sv.loadValueInternal(0, loadFullValue)
 		v.Children = sv.Children
@@ -1339,7 +1389,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 			v.loadMap(recurseLevel, cfg)
 		} else {
 			// loads length so that the client knows that the map isn't empty
-			v.mapIterator()
+			v.mapIterator(0)
 		}
 
 	case reflect.String:
@@ -1386,8 +1436,15 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 					break
 				}
 				f, _ := v.toField(field)
+				f.Name = field.Name
+				if t.StructName == "" && len(f.Name) > 0 && f.Name[0] == '&' && f.Kind == reflect.Ptr {
+					// This struct is a closure struct and the field is actually a variable
+					// captured by reference.
+					f = f.maybeDereference()
+					f.Flags |= VariableEscaped
+					f.Name = field.Name[1:]
+				}
 				v.Children = append(v.Children, *f)
-				v.Children[i].Name = field.Name
 				v.Children[i].loadValueInternal(recurseLevel+1, cfg)
 			}
 		}
@@ -1432,7 +1489,7 @@ func (v *Variable) loadValueInternal(recurseLevel int, cfg LoadConfig) {
 			v.FloatSpecial = FloatIsNaN
 		}
 	case reflect.Func:
-		v.readFunctionPtr()
+		v.loadFunctionPtr(recurseLevel, cfg)
 	default:
 		v.Unreadable = fmt.Errorf("unknown or unsupported kind: %q", v.Kind.String())
 	}
@@ -1459,7 +1516,7 @@ func convertToEface(srcv, dstv *Variable) error {
 	}
 	typeAddr, typeKind, runtimeTypeFound, err := dwarfToRuntimeType(srcv.bi, srcv.mem, srcv.RealType)
 	if err != nil {
-		return err
+		return fmt.Errorf("can not convert value of type %s to %s: %v", srcv.DwarfType.String(), dstv.DwarfType.String(), err)
 	}
 	if !runtimeTypeFound || typeKind&kindDirectIface == 0 {
 		return &typeConvErr{srcv.DwarfType, dstv.RealType}
@@ -1469,7 +1526,7 @@ func convertToEface(srcv, dstv *Variable) error {
 
 func readStringInfo(mem MemoryReadWriter, arch *Arch, addr uint64, typ *godwarf.StringType) (uint64, int64, error) {
 	// string data structure is always two ptrs in size. Addr, followed by len
-	// http://research.swtch.com/godata
+	// https://research.swtch.com/godata
 
 	mem = cacheMemory(mem, addr, arch.PtrSize()*2)
 
@@ -1610,6 +1667,10 @@ func (v *Variable) loadSliceInfo(t *godwarf.SliceType) {
 		}
 	}
 
+	if v.Addr == fakeAddressUnresolv && v.fieldType == nil {
+		return
+	}
+
 	v.stride = v.fieldType.Size()
 	if t, ok := v.fieldType.(*godwarf.PtrType); ok {
 		v.stride = t.ByteSize
@@ -1625,7 +1686,7 @@ func (v *Variable) loadChanInfo() {
 		return
 	}
 	sv := v.clone()
-	sv.RealType = resolveTypedef(&(chanType.TypedefType))
+	sv.RealType = godwarf.ResolveTypedef(&(chanType.TypedefType))
 	sv = sv.maybeDereference()
 	if sv.Unreadable != nil || sv.Addr == 0 {
 		return
@@ -1683,7 +1744,7 @@ func (v *Variable) loadArrayValues(recurseLevel int, cfg LoadConfig) {
 
 	count := v.Len
 	// Cap number of elements
-	if count > int64(cfg.MaxArrayValues) {
+	if (v.Flags&variableTrustLen == 0) && (count > int64(cfg.MaxArrayValues)) {
 		count = int64(cfg.MaxArrayValues)
 	}
 	if v.Base+uint64(v.stride*count) < v.Base {
@@ -1830,7 +1891,7 @@ func (v *Variable) readFloatRaw(size int64) (float64, error) {
 		return n, nil
 	}
 
-	return 0.0, fmt.Errorf("could not read float")
+	return 0.0, errors.New("could not read float")
 }
 
 func (v *Variable) writeFloatRaw(f float64, size int64) error {
@@ -1912,7 +1973,7 @@ func (v *Variable) writeCopy(srcv *Variable) error {
 	return err
 }
 
-func (v *Variable) readFunctionPtr() {
+func (v *Variable) loadFunctionPtr(recurseLevel int, cfg LoadConfig) {
 	// dereference pointer to find function pc
 	v.closureAddr = v.funcvalAddr()
 	if v.Unreadable != nil {
@@ -1938,6 +1999,14 @@ func (v *Variable) readFunctionPtr() {
 	}
 
 	v.Value = constant.MakeString(fn.Name)
+	cst := fn.extra(v.bi).closureStructType
+	v.Len = int64(len(cst.Field))
+
+	if recurseLevel <= cfg.MaxVariableRecurse {
+		v2 := v.newVariable("", v.closureAddr, cst, v.mem)
+		v2.loadValueInternal(recurseLevel, cfg)
+		v.Children = v2.Children
+	}
 }
 
 // funcvalAddr reads the address of the funcval contained in a function variable.
@@ -1951,11 +2020,10 @@ func (v *Variable) funcvalAddr() uint64 {
 }
 
 func (v *Variable) loadMap(recurseLevel int, cfg LoadConfig) {
-	it := v.mapIterator()
+	it := v.mapIterator(uint64(cfg.MaxMapBuckets))
 	if it == nil {
 		return
 	}
-	it.maxNumBuckets = uint64(cfg.MaxMapBuckets)
 
 	if v.Len == 0 || int64(v.mapSkip) >= v.Len || cfg.MaxArrayValues == 0 {
 		return
@@ -1963,7 +2031,7 @@ func (v *Variable) loadMap(recurseLevel int, cfg LoadConfig) {
 
 	for skip := 0; skip < v.mapSkip; skip++ {
 		if ok := it.next(); !ok {
-			v.Unreadable = fmt.Errorf("map index out of bounds")
+			v.Unreadable = errors.New("map index out of bounds")
 			return
 		}
 	}
@@ -1972,12 +2040,7 @@ func (v *Variable) loadMap(recurseLevel int, cfg LoadConfig) {
 	errcount := 0
 	for it.next() {
 		key := it.key()
-		var val *Variable
-		if it.values.fieldType.Size() > 0 {
-			val = it.value()
-		} else {
-			val = v.newVariable("", it.values.Addr, it.values.fieldType, DereferenceMemory(v.mem))
-		}
+		val := it.value()
 		key.loadValueInternal(recurseLevel+1, cfg)
 		val.loadValueInternal(recurseLevel+1, cfg)
 		if key.Unreadable != nil || val.Unreadable != nil {
@@ -1992,259 +2055,6 @@ func (v *Variable) loadMap(recurseLevel int, cfg LoadConfig) {
 			break
 		}
 	}
-}
-
-type mapIterator struct {
-	v          *Variable
-	numbuckets uint64
-	oldmask    uint64
-	buckets    *Variable
-	oldbuckets *Variable
-	b          *Variable
-	bidx       uint64
-
-	tophashes *Variable
-	keys      *Variable
-	values    *Variable
-	overflow  *Variable
-
-	maxNumBuckets uint64 // maximum number of buckets to scan
-
-	idx int64
-
-	hashTophashEmptyOne uint64 // Go 1.12 and later has two sentinel tophash values for an empty cell, this is the second one (the first one hashTophashEmptyZero, the same as Go 1.11 and earlier)
-	hashMinTopHash      uint64 // minimum value of tophash for a cell that isn't either evacuated or empty
-}
-
-// Code derived from go/src/runtime/hashmap.go
-func (v *Variable) mapIterator() *mapIterator {
-	sv := v.clone()
-	sv.RealType = resolveTypedef(&(sv.RealType.(*godwarf.MapType).TypedefType))
-	sv = sv.maybeDereference()
-	v.Base = sv.Addr
-
-	maptype, ok := sv.RealType.(*godwarf.StructType)
-	if !ok {
-		v.Unreadable = fmt.Errorf("wrong real type for map")
-		return nil
-	}
-
-	it := &mapIterator{v: v, bidx: 0, b: nil, idx: 0}
-
-	if sv.Addr == 0 {
-		it.numbuckets = 0
-		return it
-	}
-
-	v.mem = cacheMemory(v.mem, v.Base, int(v.RealType.Size()))
-
-	for _, f := range maptype.Field {
-		var err error
-		field, _ := sv.toField(f)
-		switch f.Name {
-		case "count": // +rtype -fieldof hmap int
-			v.Len, err = field.asInt()
-		case "B": // +rtype -fieldof hmap uint8
-			var b uint64
-			b, err = field.asUint()
-			it.numbuckets = 1 << b
-			it.oldmask = (1 << (b - 1)) - 1
-		case "buckets": // +rtype -fieldof hmap unsafe.Pointer
-			it.buckets = field.maybeDereference()
-		case "oldbuckets": // +rtype -fieldof hmap unsafe.Pointer
-			it.oldbuckets = field.maybeDereference()
-		}
-		if err != nil {
-			v.Unreadable = err
-			return nil
-		}
-	}
-
-	if it.buckets.Kind != reflect.Struct || it.oldbuckets.Kind != reflect.Struct {
-		v.Unreadable = errMapBucketsNotStruct
-		return nil
-	}
-
-	it.hashTophashEmptyOne = hashTophashEmptyZero
-	it.hashMinTopHash = hashMinTopHashGo111
-	if producer := v.bi.Producer(); producer != "" && goversion.ProducerAfterOrEqual(producer, 1, 12) {
-		it.hashTophashEmptyOne = hashTophashEmptyOne
-		it.hashMinTopHash = hashMinTopHashGo112
-	}
-
-	return it
-}
-
-var errMapBucketContentsNotArray = errors.New("malformed map type: keys, values or tophash of a bucket is not an array")
-var errMapBucketContentsInconsistentLen = errors.New("malformed map type: inconsistent array length in bucket")
-var errMapBucketsNotStruct = errors.New("malformed map type: buckets, oldbuckets or overflow field not a struct")
-
-func (it *mapIterator) nextBucket() bool {
-	if it.overflow != nil && it.overflow.Addr > 0 {
-		it.b = it.overflow
-	} else {
-		it.b = nil
-
-		if it.maxNumBuckets > 0 && it.bidx >= it.maxNumBuckets {
-			return false
-		}
-
-		for it.bidx < it.numbuckets {
-			it.b = it.buckets.clone()
-			it.b.Addr += uint64(it.buckets.DwarfType.Size()) * it.bidx
-
-			if it.oldbuckets.Addr <= 0 {
-				break
-			}
-
-			// if oldbuckets is not nil we are iterating through a map that is in
-			// the middle of a grow.
-			// if the bucket we are looking at hasn't been filled in we iterate
-			// instead through its corresponding "oldbucket" (i.e. the bucket the
-			// elements of this bucket are coming from) but only if this is the first
-			// of the two buckets being created from the same oldbucket (otherwise we
-			// would print some keys twice)
-
-			oldbidx := it.bidx & it.oldmask
-			oldb := it.oldbuckets.clone()
-			oldb.Addr += uint64(it.oldbuckets.DwarfType.Size()) * oldbidx
-
-			if it.mapEvacuated(oldb) {
-				break
-			}
-
-			if oldbidx == it.bidx {
-				it.b = oldb
-				break
-			}
-
-			// oldbucket origin for current bucket has not been evacuated but we have already
-			// iterated over it so we should just skip it
-			it.b = nil
-			it.bidx++
-		}
-
-		if it.b == nil {
-			return false
-		}
-		it.bidx++
-	}
-
-	if it.b.Addr <= 0 {
-		return false
-	}
-
-	it.b.mem = cacheMemory(it.b.mem, it.b.Addr, int(it.b.RealType.Size()))
-
-	it.tophashes = nil
-	it.keys = nil
-	it.values = nil
-	it.overflow = nil
-
-	for _, f := range it.b.DwarfType.(*godwarf.StructType).Field {
-		field, err := it.b.toField(f)
-		if err != nil {
-			it.v.Unreadable = err
-			return false
-		}
-		if field.Unreadable != nil {
-			it.v.Unreadable = field.Unreadable
-			return false
-		}
-
-		switch f.Name {
-		case "tophash": // +rtype -fieldof bmap [8]uint8
-			it.tophashes = field
-		case "keys":
-			it.keys = field
-		case "values":
-			it.values = field
-		case "overflow":
-			it.overflow = field.maybeDereference()
-		}
-	}
-
-	// sanity checks
-	if it.tophashes == nil || it.keys == nil || it.values == nil {
-		it.v.Unreadable = fmt.Errorf("malformed map type")
-		return false
-	}
-
-	if it.tophashes.Kind != reflect.Array || it.keys.Kind != reflect.Array || it.values.Kind != reflect.Array {
-		it.v.Unreadable = errMapBucketContentsNotArray
-		return false
-	}
-
-	if it.tophashes.Len != it.keys.Len {
-		it.v.Unreadable = errMapBucketContentsInconsistentLen
-		return false
-	}
-
-	if it.values.fieldType.Size() > 0 && it.tophashes.Len != it.values.Len {
-		// if the type of the value is zero-sized (i.e. struct{}) then the values
-		// array's length is zero.
-		it.v.Unreadable = errMapBucketContentsInconsistentLen
-		return false
-	}
-
-	if it.overflow.Kind != reflect.Struct {
-		it.v.Unreadable = errMapBucketsNotStruct
-		return false
-	}
-
-	return true
-}
-
-func (it *mapIterator) next() bool {
-	for {
-		if it.b == nil || it.idx >= it.tophashes.Len {
-			r := it.nextBucket()
-			if !r {
-				return false
-			}
-			it.idx = 0
-		}
-		tophash, _ := it.tophashes.sliceAccess(int(it.idx))
-		h, err := tophash.asUint()
-		if err != nil {
-			it.v.Unreadable = fmt.Errorf("unreadable tophash: %v", err)
-			return false
-		}
-		it.idx++
-		if h != hashTophashEmptyZero && h != it.hashTophashEmptyOne {
-			return true
-		}
-	}
-}
-
-func (it *mapIterator) key() *Variable {
-	k, _ := it.keys.sliceAccess(int(it.idx - 1))
-	return k
-}
-
-func (it *mapIterator) value() *Variable {
-	v, _ := it.values.sliceAccess(int(it.idx - 1))
-	return v
-}
-
-func (it *mapIterator) mapEvacuated(b *Variable) bool {
-	if b.Addr == 0 {
-		return true
-	}
-	for _, f := range b.DwarfType.(*godwarf.StructType).Field {
-		if f.Name != "tophash" {
-			continue
-		}
-		tophashes, _ := b.toField(f)
-		tophash0var, _ := tophashes.sliceAccess(0)
-		tophash0, err := tophash0var.asUint()
-		if err != nil {
-			return true
-		}
-		//TODO: this needs to be > hashTophashEmptyOne for go >= 1.12
-		return tophash0 > it.hashTophashEmptyOne && tophash0 < it.hashMinTopHash
-	}
-	return true
 }
 
 func (v *Variable) readInterface() (_type, data *Variable, isnil bool) {
@@ -2267,9 +2077,9 @@ func (v *Variable) readInterface() (_type, data *Variable, isnil bool) {
 
 	v.mem = cacheMemory(v.mem, v.Addr, int(v.RealType.Size()))
 
-	ityp := resolveTypedef(&v.RealType.(*godwarf.InterfaceType).TypedefType).(*godwarf.StructType)
+	ityp := godwarf.ResolveTypedef(&v.RealType.(*godwarf.InterfaceType).TypedefType).(*godwarf.StructType)
 
-	// +rtype -field iface.tab *itab
+	// +rtype -field iface.tab *itab|*internal/abi.ITab
 	// +rtype -field iface.data unsafe.Pointer
 	// +rtype -field eface._type *_type|*internal/abi.Type
 	// +rtype -field eface.data unsafe.Pointer
@@ -2277,15 +2087,18 @@ func (v *Variable) readInterface() (_type, data *Variable, isnil bool) {
 	for _, f := range ityp.Field {
 		switch f.Name {
 		case "tab": // for runtime.iface
-			tab, _ := v.toField(f) // +rtype *itab
+			tab, _ := v.toField(f) // +rtype *itab|*internal/abi.ITab
 			tab = tab.maybeDereference()
 			isnil = tab.Addr == 0
 			if !isnil {
 				var err error
-				_type, err = tab.structMember("_type") // +rtype *_type|*internal/abi.Type
+				_type, err = tab.structMember("Type") // +rtype *internal/abi.Type
 				if err != nil {
-					v.Unreadable = fmt.Errorf("invalid interface type: %v", err)
-					return
+					_type, err = tab.structMember("_type") // +rtype *_type|*internal/abi.Type
+					if err != nil {
+						v.Unreadable = fmt.Errorf("invalid interface type: %v", err)
+						return
+					}
 				}
 			}
 		case "_type": // for runtime.eface
@@ -2312,19 +2125,25 @@ func (v *Variable) loadInterface(recurseLevel int, loadData bool, cfg LoadConfig
 	}
 
 	if data == nil {
-		v.Unreadable = fmt.Errorf("invalid interface type")
+		v.Unreadable = errors.New("invalid interface type")
 		return
 	}
 
-	typ, kind, err := runtimeTypeToDIE(_type, data.Addr)
+	mds, err := LoadModuleData(_type.bi, _type.mem)
+	if err != nil {
+		v.Unreadable = fmt.Errorf("error loading module data: %v", err)
+		return
+	}
+
+	typ, directIface, err := RuntimeTypeToDIE(_type, data.Addr, mds)
 	if err != nil {
 		v.Unreadable = err
 		return
 	}
 
 	deref := false
-	if kind&kindDirectIface == 0 {
-		realtyp := resolveTypedef(typ)
+	if !directIface {
+		realtyp := godwarf.ResolveTypedef(typ)
 		if _, isptr := realtyp.(*godwarf.PtrType); !isptr {
 			typ = pointerTo(typ, v.bi.Arch)
 			deref = true
@@ -2378,47 +2197,47 @@ func (v *Variable) registerVariableTypeConv(newtyp string) (*Variable, error) {
 		var child *Variable
 		switch newtyp {
 		case "int8":
-			child = newConstant(constant.MakeInt64(int64(int8(v.reg.Bytes[i]))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int8(v.reg.Bytes[i]))), v.bi, v.mem)
 			child.Kind = reflect.Int8
 			n = 1
 		case "int16":
-			child = newConstant(constant.MakeInt64(int64(int16(binary.LittleEndian.Uint16(v.reg.Bytes[i:])))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int16(binary.LittleEndian.Uint16(v.reg.Bytes[i:])))), v.bi, v.mem)
 			child.Kind = reflect.Int16
 			n = 2
 		case "int32":
-			child = newConstant(constant.MakeInt64(int64(int32(binary.LittleEndian.Uint32(v.reg.Bytes[i:])))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(int32(binary.LittleEndian.Uint32(v.reg.Bytes[i:])))), v.bi, v.mem)
 			child.Kind = reflect.Int32
 			n = 4
 		case "int64":
-			child = newConstant(constant.MakeInt64(int64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeInt64(int64(binary.LittleEndian.Uint64(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Int64
 			n = 8
 		case "uint8":
-			child = newConstant(constant.MakeUint64(uint64(v.reg.Bytes[i])), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(v.reg.Bytes[i])), v.bi, v.mem)
 			child.Kind = reflect.Uint8
 			n = 1
 		case "uint16":
-			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint16(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint16(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Uint16
 			n = 2
 		case "uint32":
-			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint32(v.reg.Bytes[i:]))), v.mem)
+			child = newConstant(constant.MakeUint64(uint64(binary.LittleEndian.Uint32(v.reg.Bytes[i:]))), v.bi, v.mem)
 			child.Kind = reflect.Uint32
 			n = 4
 		case "uint64":
-			child = newConstant(constant.MakeUint64(binary.LittleEndian.Uint64(v.reg.Bytes[i:])), v.mem)
+			child = newConstant(constant.MakeUint64(binary.LittleEndian.Uint64(v.reg.Bytes[i:])), v.bi, v.mem)
 			child.Kind = reflect.Uint64
 			n = 8
 		case "float32":
 			a := binary.LittleEndian.Uint32(v.reg.Bytes[i:])
 			x := *(*float32)(unsafe.Pointer(&a))
-			child = newConstant(constant.MakeFloat64(float64(x)), v.mem)
+			child = newConstant(constant.MakeFloat64(float64(x)), v.bi, v.mem)
 			child.Kind = reflect.Float32
 			n = 4
 		case "float64":
 			a := binary.LittleEndian.Uint64(v.reg.Bytes[i:])
 			x := *(*float64)(unsafe.Pointer(&a))
-			child = newConstant(constant.MakeFloat64(x), v.mem)
+			child = newConstant(constant.MakeFloat64(x), v.bi, v.mem)
 			child.Kind = reflect.Float64
 			n = 8
 		default:
@@ -2434,7 +2253,7 @@ func (v *Variable) registerVariableTypeConv(newtyp string) (*Variable, error) {
 				}
 				n = n / 8
 			}
-			child = newConstant(constant.MakeString(fmt.Sprintf("%x", v.reg.Bytes[i:][:n])), v.mem)
+			child = newConstant(constant.MakeString(fmt.Sprintf("%x", v.reg.Bytes[i:][:n])), v.bi, v.mem)
 		}
 		v.Children = append(v.Children, *child)
 	}
@@ -2487,7 +2306,9 @@ func (cm constantsMap) Get(typ godwarf.Type) *constantType {
 	typepkg := packageName(typ.String()) + "."
 	if !ctyp.initialized {
 		ctyp.initialized = true
-		sort.Sort(constantValuesByValue(ctyp.values))
+		slices.SortFunc(ctyp.values, func(a, b constantValue) int {
+			return cmp.Compare(a.value, b.value)
+		})
 		for i := range ctyp.values {
 			ctyp.values[i].name = strings.TrimPrefix(ctyp.values[i].name, typepkg)
 			if bits.OnesCount64(uint64(ctyp.values[i].value)) == 1 {
@@ -2546,12 +2367,6 @@ func (v *variablesByDepthAndDeclLine) Swap(i int, j int) {
 	v.depths[i], v.depths[j] = v.depths[j], v.depths[i]
 	v.vars[i], v.vars[j] = v.vars[j], v.vars[i]
 }
-
-type constantValuesByValue []constantValue
-
-func (v constantValuesByValue) Len() int               { return len(v) }
-func (v constantValuesByValue) Less(i int, j int) bool { return v[i].value < v[j].value }
-func (v constantValuesByValue) Swap(i int, j int)      { v[i], v[j] = v[j], v[i] }
 
 const (
 	timeTimeWallHasMonotonicBit uint64 = (1 << 63) // hasMonotonic bit of time.Time.wall

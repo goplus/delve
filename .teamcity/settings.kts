@@ -41,25 +41,25 @@ To debug in IntelliJ Idea, open the 'Maven Projects' tool window (View
 version = "2023.05"
 
 val targets = arrayOf(
-        "linux/amd64/1.20",
-        "linux/amd64/1.21",
         "linux/amd64/1.22",
+        "linux/amd64/1.23",
+        "linux/amd64/1.24",
         "linux/amd64/tip",
 
-        "linux/386/1.22",
+        "linux/386/1.24",
 
-        "linux/arm64/1.22",
+        "linux/arm64/1.24",
         "linux/arm64/tip",
 
-        "linux/ppc64le/1.22",
+        "linux/ppc64le/1.24",
 
-        "windows/amd64/1.22",
+        "windows/amd64/1.24",
         "windows/amd64/tip",
 
-        "mac/amd64/1.22",
+        "mac/amd64/1.24",
         "mac/amd64/tip",
 
-        "mac/arm64/1.22",
+        "mac/arm64/1.24",
         "mac/arm64/tip"
 )
 
@@ -268,6 +268,7 @@ class TestBuild(val os: String, val arch: String, val version: String, buildId: 
             "386", "amd64" -> equals("teamcity.agent.jvm.os.arch", if (os == "mac") "x86_64" else "amd64")
             "arm64" -> equals("teamcity.agent.jvm.os.arch", "aarch64")
             "ppc64le" -> equals("teamcity.agent.jvm.os.arch", "ppc64le")
+            // "riscv64" -> equals("teamcity.agent.jvm.os.arch", "riscv64") // The riscv64 needs a builder
         }
         when (os) {
             "linux" -> {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"debug/macho"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -46,7 +47,8 @@ type gdbConn struct {
 	goarch                string
 	goos                  string
 
-	useXcmd bool // forces writeMemory to use the 'X' command
+	useXcmd       bool // forces writeMemory to use the 'X' command
+	newRRCmdStyle bool // forces qRRCmd to use the post-5.8.0 style always
 
 	log logflags.Logger
 }
@@ -532,6 +534,10 @@ func (conn *gdbConn) readRegister(threadID string, regnum int, data []byte) erro
 		return err
 	}
 
+	if len(resp) > len(data)*2 {
+		return fmt.Errorf("wrong response length, expected %d got %d", len(data)*2, len(resp))
+	}
+
 	for i := 0; i < len(resp); i += 2 {
 		n, _ := strconv.ParseUint(string(resp[i:i+2]), 16, 8)
 		data[i/2] = uint8(n)
@@ -723,6 +729,17 @@ type stopPacket struct {
 	sig       uint8
 	reason    string
 	watchAddr uint64
+	watchReg  int
+	jstopInfo map[int]stopPacket
+	regs      map[uint64]uint64
+}
+
+type jsonStopPacket struct {
+	Tid    int      `json:"tid"`
+	Signal int      `json:"signal"`
+	Metype int      `json:"metype"`
+	Medata []uint64 `json:"medata"`
+	Reason string   `json:"reason"`
 }
 
 // Mach exception codes used to decode metype/medata keys in stop packets (necessary to support watchpoints with debugserver).
@@ -732,9 +749,10 @@ type stopPacket struct {
 //	https://opensource.apple.com/source/xnu/xnu-4570.1.46/osfmk/mach/i386/exception.h.auto.html
 //	https://opensource.apple.com/source/xnu/xnu-4570.1.46/osfmk/mach/arm/exception.h.auto.html
 const (
-	_EXC_BREAKPOINT   = 6     // mach exception type for hardware breakpoints
-	_EXC_I386_SGL     = 1     // mach exception code for single step on x86, for some reason this is also used for watchpoints
-	_EXC_ARM_DA_DEBUG = 0x102 // mach exception code for debug fault on arm/arm64
+	_EXC_BREAKPOINT     = 6     // mach exception type for hardware breakpoints
+	_EXC_I386_SGL       = 1     // mach exception code for single step on x86, for some reason this is also used for watchpoints
+	_EXC_ARM_DA_DEBUG   = 0x102 // mach exception code for debug fault on arm/arm64
+	_EXC_ARM_BREAKPOINT = 1     // mach exception code for breakpoint on arm/arm64
 )
 
 // executes 'vCont' (continue/step) command
@@ -750,17 +768,54 @@ func (conn *gdbConn) parseStopPacket(resp []byte, threadID string, tu *threadUpd
 			return false, stopPacket{}, fmt.Errorf("malformed stop packet: %s", string(resp))
 		}
 		sp.sig = uint8(sig)
+		sp.watchReg = -1
+		sp.regs = make(map[uint64]uint64)
 
 		if logflags.GdbWire() && gdbWireFullStopPacket {
 			conn.log.Debugf("full stop packet: %s", string(resp))
 		}
 
 		var metype int
-		var medata = make([]uint64, 0, 10)
+		medata := make([]uint64, 0, 10)
+
+		parseMachException := func(sp *stopPacket, metype int, medata []uint64) {
+			// Debugserver does not report watchpoint stops in the standard way preferring
+			// instead the semi-undocumented metype/medata keys.
+			// These values also have different meanings depending on the CPU architecture.
+			switch conn.goarch {
+			case "amd64":
+				if metype == _EXC_BREAKPOINT && len(medata) >= 2 && medata[0] == _EXC_I386_SGL {
+					sp.watchAddr = medata[1] // this should be zero if this is really a single step stop and non-zero for watchpoints
+				}
+			case "arm64":
+				if metype == _EXC_BREAKPOINT && len(medata) >= 2 && (medata[0] == _EXC_ARM_DA_DEBUG || medata[0] == _EXC_ARM_BREAKPOINT) {
+					// The arm64 specification allows for up to 16 debug registers.
+					// The registers are zero indexed, thus a value less than 16 will
+					// be a hardware breakpoint register index.
+					// See: https://developer.arm.com/documentation/102120/0101/Debug-exceptions
+					// TODO(deparker): we can ask debugserver for the number of hardware breakpoints
+					// directly.
+					if medata[1] < 16 {
+						sp.watchReg = int(medata[1])
+					} else {
+						sp.watchAddr = medata[1]
+					}
+				}
+			}
+		}
 
 		csp := colonSemicolonParser{buf: resp[3:]}
 		for csp.next() {
 			key, value := csp.key, csp.value
+
+			if reg, err := strconv.ParseUint(string(key), 16, 64); err == nil {
+				// This is a register.
+				v, err := strconv.ParseUint(string(value), 16, 64)
+				if err != nil {
+					return false, stopPacket{}, fmt.Errorf("malformed stop packet: %s", string(resp))
+				}
+				sp.regs[reg] = v
+			}
 
 			switch string(key) {
 			case "thread":
@@ -784,30 +839,36 @@ func (conn *gdbConn) parseStopPacket(resp []byte, threadID string, tu *threadUpd
 				// mach exception data (debugserver extension)
 				d, _ := strconv.ParseUint(string(value), 16, 64)
 				medata = append(medata, d)
+			case "jstopinfo":
+				jstopinfo, err := hex.DecodeString(string(value))
+				if err != nil {
+					return false, stopPacket{}, fmt.Errorf("malformed stop packet: %s (wrong jstopinfo)", string(resp))
+				}
+				parsedJstopInfo := []jsonStopPacket{}
+				if err := json.Unmarshal(jstopinfo, &parsedJstopInfo); err != nil {
+					return false, stopPacket{}, fmt.Errorf("malformed stop packet: %s (wrong jstopinfo)", string(resp))
+				}
+				sp.jstopInfo = make(map[int]stopPacket)
+				for _, jsp := range parsedJstopInfo {
+					threadID := fmt.Sprintf("%d", jsp.Tid)
+					newStopPacket := stopPacket{
+						threadID: threadID,
+						reason:   jsp.Reason,
+						sig:      uint8(jsp.Signal),
+					}
+					parseMachException(&newStopPacket, jsp.Metype, jsp.Medata)
+					sp.jstopInfo[jsp.Tid] = newStopPacket
+				}
 			}
 		}
 
-		// Debugserver does not report watchpoint stops in the standard way preferring
-		// instead the semi-undocumented metype/medata keys.
-		// These values also have different meanings depending on the CPU architecture.
-		switch conn.goarch {
-		case "amd64":
-			if metype == _EXC_BREAKPOINT && len(medata) >= 2 && medata[0] == _EXC_I386_SGL {
-				sp.watchAddr = medata[1] // this should be zero if this is really a single step stop and non-zero for watchpoints
-			}
-		case "arm64":
-			if metype == _EXC_BREAKPOINT && len(medata) >= 2 && medata[0] == _EXC_ARM_DA_DEBUG {
-				sp.watchAddr = medata[1]
-			}
-		}
+		parseMachException(&sp, metype, medata)
 
 		return false, sp, nil
 
 	case 'W', 'X':
 		// process exited, next two character are exit code
-
 		semicolon := bytes.Index(resp, []byte{';'})
-
 		if semicolon < 0 {
 			semicolon = len(resp)
 		}
@@ -929,7 +990,10 @@ func (conn *gdbConn) queryThreads(first bool) (threads []string, err error) {
 }
 
 func (conn *gdbConn) selectThread(kind byte, threadID string, context string) error {
-	if conn.threadSuffixSupported {
+	if conn.threadSuffixSupported && kind != 'c' {
+		// kind == 'c' is still allowed because 'rr' is weird about it's support
+		// for thread suffixes and the specification for it doesn't really say how
+		// it should be used with packets 'bc' and 'bs'.
 		panic("selectThread when thread suffix is supported")
 	}
 	conn.outbuf.Reset()
@@ -1133,9 +1197,15 @@ func (conn *gdbConn) qRRCmd(args ...string) (string, error) {
 	}
 	conn.outbuf.Reset()
 	fmt.Fprint(&conn.outbuf, "$qRRCmd")
-	for _, arg := range args {
+	for i, arg := range args {
 		fmt.Fprint(&conn.outbuf, ":")
-		writeAsciiBytes(&conn.outbuf, []byte(arg))
+		if i == 0 && (conn.newRRCmdStyle || conn.threadSuffixSupported) {
+			// newer versions of RR require the command to be followed by a thread id
+			// and the command name to be unescaped.
+			fmt.Fprintf(&conn.outbuf, "%s:-1", arg)
+		} else {
+			writeAsciiBytes(&conn.outbuf, []byte(arg))
+		}
 	}
 	resp, err := conn.exec(conn.outbuf.Bytes(), "qRRCmd")
 	if err != nil {

@@ -3,7 +3,7 @@
 [![Build Status](https://github.com/goplus/mod/actions/workflows/go.yml/badge.svg)](https://github.com/goplus/mod/actions/workflows/go.yml)
 [![license](http://img.shields.io/badge/license-MIT-blue.svg)](https://raw.githubusercontent.com/go-delve/delve/master/LICENSE)
 [![GoDoc](https://godoc.org/github.com/go-delve/delve?status.svg)](https://godoc.org/github.com/go-delve/delve)
-[![Language](https://img.shields.io/badge/language-Go+-blue.svg)](https://github.com/goplus/gop)
+[![Language](https://img.shields.io/badge/language-Go+-blue.svg)](https://github.com/goplus/xgo)
 
 The GitHub issue tracker is for **bugs** only. Please use the [developer mailing list](https://groups.google.com/forum/#!forum/delve-dev) for any feature proposals and discussions.
 

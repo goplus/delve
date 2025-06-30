@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -51,7 +52,7 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	logflags.Setup(logOutput != "", logOutput, "")
-	os.Exit(protest.RunTestsWithFixtures(m))
+	protest.RunTestsWithFixtures(m)
 }
 
 func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
@@ -69,7 +70,7 @@ func startServer(name string, buildFlags protest.BuildFlags, t *testing.T, redir
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
-	fixture = protest.BuildFixture(name, buildFlags)
+	fixture = protest.BuildFixture(t, name, buildFlags)
 	for i := range redirects {
 		if redirects[i] != "" {
 			redirects[i] = filepath.Join(fixture.BuildDir, redirects[i])
@@ -625,66 +626,46 @@ func TestClientServer_disableHitCondLSSBreakpoint(t *testing.T) {
 			Line:    7,
 			HitCond: "< 3",
 		})
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
+		assertNoError(err, t, "CreateBreakpoint")
+		bp, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 8})
+		assertNoError(err, t, "CreateBreakpoint")
+
+		if len(bp.Addrs) == 0 {
+			t.Fatalf("no addresses for breakpoint")
 		}
 
-		state := <-c.Continue()
-		if state.Err != nil {
-			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
+		continueTo := func(ln int, ival string) {
+			state := <-c.Continue()
+			assertNoError(state.Err, t, fmt.Sprintf("Unexpected error: %v, state: %#v", state.Err, state))
+
+			f, l := state.CurrentThread.File, state.CurrentThread.Line
+			if f != fp || l != ln {
+				t.Fatalf("Program did not hit breakpoint %s:%d", f, l)
+			}
+
+			if ival == "" {
+				return
+			}
+
+			ivar, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "i", normalLoadConfig)
+			assertNoError(err, t, "EvalVariable")
+
+			t.Logf("ivar: %s", ivar.SinglelineString())
+
+			if ivar.Value != ival {
+				t.Fatalf("Wrong variable value: %s", ivar.Value)
+			}
 		}
 
-		f, l := state.CurrentThread.File, state.CurrentThread.Line
-		if f != "break.go" && l != 7 {
-			t.Fatal("Program did not hit breakpoint")
-		}
-
-		ivar, err := c.EvalVariable(api.EvalScope{GoroutineID: -1}, "i", normalLoadConfig)
-		assertNoError(err, t, "EvalVariable")
-
-		t.Logf("ivar: %s", ivar.SinglelineString())
-
-		if ivar.Value != "1" {
-			t.Fatalf("Wrong variable value: %s", ivar.Value)
-		}
-
-		bp, err := c.GetBreakpoint(hitCondBp.ID)
-		assertNoError(err, t, "GetBreakpoint()")
-
-		if bp.Disabled {
-			t.Fatalf(
-				"Hit condition %s is still satisfiable but breakpoint has been disabled",
-				bp.HitCond,
-			)
-		}
-
-		state = <-c.Continue()
-		if state.Err != nil {
-			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
-		}
-
-		f, l = state.CurrentThread.File, state.CurrentThread.Line
-		if f != "break.go" && l != 7 {
-			t.Fatal("Program did not hit breakpoint")
-		}
-
-		ivar, err = c.EvalVariable(api.EvalScope{GoroutineID: -1}, "i", normalLoadConfig)
-		assertNoError(err, t, "EvalVariable")
-
-		t.Logf("ivar: %s", ivar.SinglelineString())
-
-		if ivar.Value != "2" {
-			t.Fatalf("Wrong variable value: %s", ivar.Value)
-		}
+		continueTo(7, "1")
+		continueTo(7, "2")
+		continueTo(8, "")
 
 		bp, err = c.GetBreakpoint(hitCondBp.ID)
 		assertNoError(err, t, "GetBreakpoint()")
 
-		if !bp.Disabled {
-			t.Fatalf(
-				"Hit condition %s is no more satisfiable but breakpoint has not been disabled",
-				bp.HitCond,
-			)
+		if len(bp.Addrs) != 0 {
+			t.Fatalf("Hit condition %s is no longer satisfiable but breakpoint has not been disabled", bp.HitCond)
 		}
 	})
 }
@@ -697,17 +678,19 @@ func TestClientServer_disableHitEQLCondBreakpoint(t *testing.T) {
 			Line:    7,
 			HitCond: "== 3",
 		})
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
+		assertNoError(err, t, "CreateBreakpoint")
+		bp, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 8})
+		assertNoError(err, t, "CreateBreakpoint")
+
+		if len(bp.Addrs) == 0 {
+			t.Fatalf("no addresses for breakpoint")
 		}
 
 		state := <-c.Continue()
-		if state.Err != nil {
-			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
-		}
+		assertNoError(state.Err, t, "Continue")
 
 		f, l := state.CurrentThread.File, state.CurrentThread.Line
-		if f != "break.go" && l != 7 {
+		if f != fp || l != 7 {
 			t.Fatal("Program did not hit breakpoint")
 		}
 
@@ -720,14 +703,18 @@ func TestClientServer_disableHitEQLCondBreakpoint(t *testing.T) {
 			t.Fatalf("Wrong variable value: %s", ivar.Value)
 		}
 
-		bp, err := c.GetBreakpoint(hitCondBp.ID)
+		state = <-c.Continue()
+		assertNoError(state.Err, t, "Continue")
+
+		if state.CurrentThread.File != fp || state.CurrentThread.Line != 8 {
+			t.Fatal("Program did not hit breakpoint")
+		}
+
+		bp, err = c.GetBreakpoint(hitCondBp.ID)
 		assertNoError(err, t, "GetBreakpoint()")
 
-		if !bp.Disabled {
-			t.Fatalf(
-				"Hit condition %s is no more satisfiable but breakpoint has not been disabled",
-				bp.HitCond,
-			)
+		if len(bp.Addrs) != 0 {
+			t.Fatalf("Hit condition %s is no more satisfiable but breakpoint has not been disabled", bp.HitCond)
 		}
 	})
 }
@@ -795,6 +782,42 @@ func TestClientServer_infoLocals(t *testing.T) {
 		if len(locals) != 3 {
 			t.Fatalf("Expected 3 locals, got %d %#v", len(locals), locals)
 		}
+	})
+}
+
+func matchFunctions(t *testing.T, funcs []string, expected []string, depth int) {
+	for i := range funcs {
+		if funcs[i] != expected[i] {
+			t.Fatalf("Function %s  not found in ListFunctions --follow-calls=%d output", expected[i], depth)
+		}
+	}
+}
+
+func TestTraceFollowCallsCommand(t *testing.T) {
+	protest.AllowRecording(t)
+	withTestClient2("testtracefns", t, func(c service.Client) {
+		depth := 3
+		functions, err := c.ListFunctions("main.A", depth)
+		assertNoError(err, t, "ListFunctions()")
+		expected := []string{"main.A", "main.B", "main.C", "main.D"}
+		matchFunctions(t, functions, expected, depth)
+
+		functions, err = c.ListFunctions("main.first", depth)
+		assertNoError(err, t, "ListFunctions()")
+		expected = []string{"main.first", "main.second"}
+		matchFunctions(t, functions, expected, depth)
+
+		depth = 4
+		functions, err = c.ListFunctions("main.callme", depth)
+		assertNoError(err, t, "ListFunctions()")
+		expected = []string{"main.callme", "main.callme2", "main.callmed", "main.callmee"}
+		matchFunctions(t, functions, expected, depth)
+
+		depth = 6
+		functions, err = c.ListFunctions("main.F0", depth)
+		assertNoError(err, t, "ListFunctions()")
+		expected = []string{"main.F0", "main.F0.func1", "main.F1", "main.F2", "main.F3", "main.F4", "runtime.deferreturn", "runtime.gopanic", "runtime.gorecover"}
+		matchFunctions(t, functions, expected, depth)
 	})
 }
 
@@ -891,7 +914,6 @@ func TestClientServer_traceContinue(t *testing.T) {
 			if state.Err != nil {
 				t.Fatalf("Unexpected error during continue: %v\n", state.Err)
 			}
-
 		}
 
 		if count != 3 {
@@ -931,7 +953,6 @@ func TestClientServer_traceContinue2(t *testing.T) {
 			if state.Err != nil {
 				t.Fatalf("Unexpected error during continue: %v\n", state.Err)
 			}
-
 		}
 
 		if countMain != 1 {
@@ -1011,7 +1032,6 @@ func TestClientServer_FindLocations(t *testing.T) {
 		if locsNoSubst[0].PC != locsSubst[0].PC {
 			t.Fatalf("FindLocation with substitute rules mismatch %#v %#v", locsNoSubst[0], locsSubst[0])
 		}
-
 	})
 
 	withTestClient2("testnextdefer", t, func(c service.Client) {
@@ -1334,7 +1354,7 @@ func TestIssue355(t *testing.T) {
 		assertErrorOrExited(s, err, t, "Next()")
 		s, err = c.Step()
 		assertErrorOrExited(s, err, t, "Step()")
-		s, err = c.StepInstruction()
+		s, err = c.StepInstruction(false)
 		assertErrorOrExited(s, err, t, "StepInstruction()")
 		s, err = c.SwitchThread(tid)
 		assertErrorOrExited(s, err, t, "SwitchThread()")
@@ -1418,7 +1438,7 @@ func TestDisasm(t *testing.T) {
 		// look for static call to afunction() on line 29
 		found := false
 		for i := range d3 {
-			if d3[i].Loc.Line == 29 && (strings.HasPrefix(d3[i].Text, "call") || strings.HasPrefix(d3[i].Text, "CALL")) && d3[i].DestLoc != nil && d3[i].DestLoc.Function != nil && d3[i].DestLoc.Function.Name() == "main.afunction" {
+			if d3[i].Loc.Line == 29 && (strings.HasPrefix(d3[i].Text, "bl") || strings.HasPrefix(d3[i].Text, "jirl") || strings.HasPrefix(d3[i].Text, "call") || strings.HasPrefix(d3[i].Text, "CALL")) && d3[i].DestLoc != nil && d3[i].DestLoc.Function != nil && d3[i].DestLoc.Function.Name() == "main.afunction" {
 				found = true
 				break
 			}
@@ -1452,7 +1472,7 @@ func TestDisasm(t *testing.T) {
 			if count > 20 {
 				t.Fatal("too many step instructions executed without finding a call instruction")
 			}
-			state, err := c.StepInstruction()
+			state, err := c.StepInstruction(false)
 			assertNoError(err, t, fmt.Sprintf("StepInstruction() %d", count))
 
 			d3, err = c.DisassemblePC(api.EvalScope{GoroutineID: -1}, state.CurrentThread.PC, api.IntelFlavour)
@@ -1468,7 +1488,7 @@ func TestDisasm(t *testing.T) {
 				t.Fatal("Calling StepInstruction() repeatedly did not find the call instruction")
 			}
 
-			if strings.HasPrefix(curinstr.Text, "call") || strings.HasPrefix(curinstr.Text, "CALL") {
+			if strings.HasPrefix(curinstr.Text, "call") || strings.HasPrefix(curinstr.Text, "CALL") || strings.HasPrefix(curinstr.Text, "bl") || strings.HasPrefix(curinstr.Text, "jirl") {
 				t.Logf("call: %v", curinstr)
 				if curinstr.DestLoc == nil || curinstr.DestLoc.Function == nil {
 					t.Fatalf("Call instruction does not have destination: %v", curinstr)
@@ -1616,14 +1636,7 @@ func TestTypesCommand(t *testing.T) {
 		types, err := c.ListTypes("")
 		assertNoError(err, t, "ListTypes()")
 
-		found := false
-		for i := range types {
-			if types[i] == "main.astruct" {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !slices.Contains(types, "main.astruct") {
 			t.Fatal("Type astruct not found in ListTypes output")
 		}
 
@@ -2048,7 +2061,7 @@ func TestAcceptMulticlient(t *testing.T) {
 		disconnectChan := make(chan struct{})
 		server := rpccommon.NewServer(&service.Config{
 			Listener:       listener,
-			ProcessArgs:    []string{protest.BuildFixture("testvariables2", 0).Path},
+			ProcessArgs:    []string{protest.BuildFixture(t, "testvariables2", 0).Path},
 			AcceptMulti:    true,
 			DisconnectChan: disconnectChan,
 			Debugger: debugger.Config{
@@ -2086,7 +2099,7 @@ func TestForceStopWhileContinue(t *testing.T) {
 		defer listener.Close()
 		server := rpccommon.NewServer(&service.Config{
 			Listener:       listener,
-			ProcessArgs:    []string{protest.BuildFixture("http_server", protest.AllNonOptimized).Path},
+			ProcessArgs:    []string{protest.BuildFixture(t, "http_server", protest.AllNonOptimized).Path},
 			AcceptMulti:    true,
 			DisconnectChan: disconnectChan,
 			Debugger: debugger.Config{
@@ -2474,7 +2487,7 @@ func TestDetachLeaveRunning(t *testing.T) {
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
-	fixture := protest.BuildFixture("testnextnethttp", buildFlags)
+	fixture := protest.BuildFixture(t, "testnextnethttp", buildFlags)
 
 	cmd := exec.Command(fixture.Path)
 	cmd.Stdout = os.Stdout
@@ -2553,7 +2566,7 @@ func TestStopServerWithClosedListener(t *testing.T) {
 	}
 	listener, err := net.Listen("tcp", "localhost:0")
 	assertNoError(err, t, "listener")
-	fixture := protest.BuildFixture("math", 0)
+	fixture := protest.BuildFixture(t, "math", 0)
 	server := rpccommon.NewServer(&service.Config{
 		Listener:           listener,
 		AcceptMulti:        false,
@@ -2623,7 +2636,6 @@ func TestLongStringArg(t *testing.T) {
 			t.Logf("%#v\n", var2)
 			if var2.Value != val2 {
 				t.Fatalf("wrong value for variable: %q", var2.Value)
-
 			}
 			return var1.Addr
 		}
@@ -2764,6 +2776,8 @@ func TestClientServer_SinglelineStringFormattedWithBigInts(t *testing.T) {
 			"9331634762088972288", "8180A06000000000",
 			"9259436018245828608", "8080200000000000",
 			"9259436018245828608", "8080200000000000",
+			"0", "0", "0", "0",
+			"0", "0", "0", "0",
 		}
 
 		for i := range xmm0var.Children {
@@ -2788,6 +2802,9 @@ func TestNonGoDebug(t *testing.T) {
 	// Test that we can at least set breakpoints while debugging a non-go executable.
 	if runtime.GOOS != "linux" {
 		t.Skip()
+	}
+	if objcopyPath, _ := exec.LookPath("cc"); objcopyPath == "" {
+		t.Skip("no C compiler in path")
 	}
 	dir := protest.FindFixturesDir()
 	path := protest.TempFile("testc")
@@ -2828,11 +2845,12 @@ func TestRestart_PreserveFunctionBreakpoint(t *testing.T) {
 	// even if the function changed position in the source file.
 
 	dir := protest.FindFixturesDir()
+	outpath := filepath.Join(dir, "testfnpos.go")
+	defer os.Remove(outpath)
 
 	copy := func(inpath string) {
 		buf, err := os.ReadFile(inpath)
 		assertNoError(err, t, fmt.Sprintf("Reading %q", inpath))
-		outpath := filepath.Join(dir, "testfnpos.go")
 		assertNoError(os.WriteFile(outpath, buf, 0o666), t, fmt.Sprintf("Creating %q", outpath))
 	}
 
@@ -3099,5 +3117,225 @@ func TestClientServer_chanGoroutines(t *testing.T) {
 		if len(gs) != 1 || recvq != 1 || sendq != 0 {
 			t.Error("wrong number of goroutines for blockingchan2")
 		}
+	})
+}
+
+func TestNextInstruction(t *testing.T) {
+	protest.AllowRecording(t)
+	withTestClient2("testprog", t, func(c service.Client) {
+		fp := testProgPath(t, "testprog")
+		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 19})
+		assertNoError(err, t, "CreateBreakpoint()")
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue()")
+
+		state, err = c.StepInstruction(true)
+		assertNoError(err, t, "Step()")
+		if state.CurrentThread.Line != 20 {
+			t.Fatalf("expected line %d got %d", 20, state.CurrentThread.Line)
+		}
+	})
+}
+
+func TestBreakpointVariablesWithoutG(t *testing.T) {
+	// Tests that evaluating variables on a breakpoint that is hit on a thread
+	// without a goroutine does not cause an error.
+	withTestClient2("math", t, func(c service.Client) {
+		_, err := c.CreateBreakpoint(&api.Breakpoint{
+			FunctionName: "runtime.mallocgc",
+			LoadArgs:     &normalLoadConfig,
+		})
+		assertNoError(err, t, "CreateBreakpoint")
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue()")
+	})
+}
+
+func TestGuessSubstitutePath(t *testing.T) {
+	protest.MustHaveModules(t)
+
+	t.Setenv("NOCERT", "1")
+	ver, _ := goversion.Parse(runtime.Version())
+	if ver.IsDevelBuild() && os.Getenv("CI") != "" && runtime.GOOS == "linux" {
+		// The TeamCity builders for linux/amd64/tip and linux/arm64/tip end up
+		// with a broken .git directory which makes the 'go list' command used for
+		// GuessSubstitutePath fail.
+		t.Skip("does not work in TeamCity + tip + linux")
+	}
+
+	slashnorm := func(s string) string {
+		if runtime.GOOS != "windows" {
+			return s
+		}
+		return strings.ReplaceAll(s, "\\", "/")
+	}
+
+	guess := func(t *testing.T, goflags string) [][2]string {
+		oldgoflags := os.Getenv("GOFLAGS")
+		os.Setenv("GOFLAGS", goflags)
+		defer os.Setenv("GOFLAGS", oldgoflags)
+
+		dlvbin := protest.GetDlvBinary(t)
+
+		listener, clientConn := service.ListenerPipe()
+		defer listener.Close()
+		server := rpccommon.NewServer(&service.Config{
+			Listener:    listener,
+			ProcessArgs: []string{dlvbin, "help"},
+			Debugger: debugger.Config{
+				Backend:        testBackend,
+				CheckGoVersion: true,
+				BuildFlags:     "", // build flags can be an empty string here because the only test that uses it, does not set special flags.
+				ExecuteKind:    debugger.ExecutingExistingFile,
+			},
+		})
+		if err := server.Run(); err != nil {
+			t.Fatal(err)
+		}
+
+		client := rpc2.NewClientFromConn(clientConn)
+		defer client.Detach(true)
+
+		switch runtime.GOARCH {
+		case "ppc64le":
+			os.Setenv("GOFLAGS", "-tags=exp.linuxppc64le")
+		case "riscv64":
+			os.Setenv("GOFLAGS", "-tags=exp.linuxriscv64")
+		case "loong64":
+			os.Setenv("GOFLAGS", "-tags=exp.linuxloong64")
+		}
+
+		gsp, err := client.GuessSubstitutePath()
+		assertNoError(err, t, "GuessSubstitutePath")
+		return gsp
+	}
+
+	delvePath := protest.ProjectRoot()
+	var nmods int = -1
+
+	t.Run("Normal", func(t *testing.T) {
+		gsp := guess(t, "")
+		t.Logf("Normal build: %d", len(gsp))
+		if len(gsp) == 0 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] != slashnorm(e[1]) {
+				t.Fatalf("mismatch %q %q", e[0], e[1])
+			}
+			if e[1] == delvePath {
+				found = true
+			}
+		}
+		nmods = len(gsp)
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
+
+		if os.Getenv("CI") == "true" {
+			return
+		}
+	})
+
+	t.Run("Modules", func(t *testing.T) {
+		gsp := guess(t, "-mod=mod")
+		t.Logf("Modules build: %d", len(gsp))
+		if len(gsp) != nmods && nmods != -1 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] == slashnorm(delvePath) && e[1] == delvePath {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
+	})
+
+	t.Run("Trimpath", func(t *testing.T) {
+		gsp := guess(t, "-trimpath")
+		t.Logf("Trimpath build: %d", len(gsp))
+		if len(gsp) != nmods && nmods != -1 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] == "github.com/go-delve/delve" && e[1] == delvePath {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
+	})
+
+	t.Run("ModulesTrimpath", func(t *testing.T) {
+		gsp := guess(t, "-trimpath -mod=mod")
+		t.Logf("Modules+Trimpath build: %d", len(gsp))
+		if len(gsp) != nmods && nmods != -1 {
+			t.Fatalf("not enough modules")
+		}
+		found := false
+		for _, e := range gsp {
+			t.Logf("\t%s -> %s", e[0], e[1])
+			if e[0] == "github.com/go-delve/delve" && e[1] == delvePath {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("could not find main module path %q", delvePath)
+		}
+	})
+}
+
+func TestFollowExecFindLocation(t *testing.T) {
+	// FindLocation should not return an error if at least one of the currently
+	// attached targets can find the specified location.
+	// See issue #3933
+	if runtime.GOOS == "freebsd" || runtime.GOOS == "darwin" {
+		t.Skip("follow exec not implemented")
+	}
+	var buildFlags protest.BuildFlags
+	if buildMode == "pie" {
+		buildFlags |= protest.BuildModePIE
+	}
+	childFixture := protest.BuildFixture(t, "spawnchild", buildFlags)
+
+	withTestClient2Extended("spawn", t, 0, [3]string{}, []string{"spawn2", childFixture.Path}, func(c service.Client, fixture protest.Fixture) {
+		assertNoError(c.FollowExec(true, ""), t, "FollowExec")
+		_, err := c.CreateBreakpointWithExpr(&api.Breakpoint{File: childFixture.Source, Line: 9}, fmt.Sprintf("%s:%d", childFixture.Source, 9), nil, true)
+		assertNoError(err, t, "CreateBreakpoint(spawnchild.go:9)")
+
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "Continue()")
+
+		tgts, err := c.ListTargets()
+		assertNoError(err, t, "ListTargets")
+
+		t.Logf("%v\n", tgts)
+		found := false
+		for _, tgt := range tgts {
+			if tgt.Pid == state.Pid {
+				if !strings.Contains(tgt.CmdLine, "spawnchild") {
+					t.Fatalf("did not switch to child process")
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("current target not found")
+		}
+
+		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, fmt.Sprintf("%s:%d", childFixture.Source, 6), true, nil)
+		assertNoError(err, t, "FindLocation(spawnchild.go:6)")
+
+		_, _, err = c.FindLocation(api.EvalScope{GoroutineID: -1}, fmt.Sprintf("%s:%d", fixture.Source, 19), true, nil)
+		assertNoError(err, t, "FindLocation(spawn.go:19)")
 	})
 }

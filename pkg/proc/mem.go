@@ -35,17 +35,33 @@ type memCache struct {
 }
 
 func (m *memCache) contains(addr uint64, size int) bool {
-	return addr >= m.cacheAddr && addr <= (m.cacheAddr+uint64(len(m.cache)-size))
+	end := addr + uint64(size)
+	if end < addr {
+		// overflow
+		return false
+	}
+	return addr >= m.cacheAddr && end <= m.cacheAddr+uint64(len(m.cache))
+}
+
+func (m *memCache) load() error {
+	if m.loaded {
+		return nil
+	}
+	_, err := m.mem.ReadMemory(m.cache, m.cacheAddr)
+	if err != nil {
+		return err
+	}
+	m.loaded = true
+	return nil
 }
 
 func (m *memCache) ReadMemory(data []byte, addr uint64) (n int, err error) {
 	if m.contains(addr, len(data)) {
 		if !m.loaded {
-			_, err := m.mem.ReadMemory(m.cache, m.cacheAddr)
+			err := m.load()
 			if err != nil {
 				return 0, err
 			}
-			m.loaded = true
 		}
 		copy(data, m.cache[addr-m.cacheAddr:])
 		return len(data), nil
@@ -67,6 +83,10 @@ func cacheMemory(mem MemoryReadWriter, addr uint64, size int) MemoryReadWriter {
 		return mem
 	}
 	if size <= 0 {
+		return mem
+	}
+	if addr+uint64(size) < addr {
+		// overflow
 		return mem
 	}
 	switch cacheMem := mem.(type) {
@@ -170,7 +190,11 @@ func (mem *compositeMemory) WriteMemory(addr uint64, data []byte) (int, error) {
 		return 0, errors.New("write out of bounds")
 	}
 	if mem.regs.ChangeFunc == nil {
-		return 0, errors.New("can not write registers")
+		for _, piece := range mem.pieces {
+			if piece.Kind == op.RegPiece {
+				return 0, errors.New("can not write registers")
+			}
+		}
 	}
 
 	copy(mem.data[addr:], data)
@@ -196,7 +220,6 @@ func (mem *compositeMemory) WriteMemory(addr uint64, data []byte) (int, error) {
 					return donesz + n, err
 				}
 			case op.ImmPiece:
-				//TODO(aarzilli): maybe return an error if the user tried to change the value?
 				// nothing to do
 			default:
 				panic("unsupported piece kind")

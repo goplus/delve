@@ -7,12 +7,13 @@ import (
 	"fmt"
 	"go/ast"
 	"go/constant"
-	"go/token"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/go-delve/delve/pkg/astutil"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
@@ -43,6 +44,9 @@ import (
 //  - evalop.CallInjectionSetTarget
 //  - evalCallInjectionCopyArg
 //  - evalCallInjectionComplete
+//
+// When the target has runtime.debugPinner then evalCallInjectionPinPointer
+// must be also called in a loop until it returns false.
 
 const (
 	debugCallFunctionNamePrefix1 = "debugCall"
@@ -90,12 +94,20 @@ type functionCallState struct {
 	// it contains information on how to undo a function call injection without running it
 	undoInjection *undoInjection
 
+	// hasDebugPinner is true if the target has runtime.debugPinner
+	hasDebugPinner bool
+	// doPinning is true if this call injection should pin the results
+	doPinning bool
+	// addrsToPin addresses from return variables that should be pinned
+	addrsToPin []uint64
+
 	protocolReg   uint64
 	debugCallName string
 }
 
 type undoInjection struct {
 	oldpc, oldlr uint64
+	doComplete2  bool
 }
 
 type callContext struct {
@@ -124,10 +136,14 @@ type callInjection struct {
 	endCallInjection func()
 }
 
+//lint:ignore U1000 this variable is only used by tests
+var debugPinCount int
+
 // EvalExpressionWithCalls is like EvalExpression but allows function calls in 'expr'.
 // Because this can only be done in the current goroutine, unlike
 // EvalExpression, EvalExpressionWithCalls is not a method of EvalScope.
 func EvalExpressionWithCalls(grp *TargetGroup, g *G, expr string, retLoadCfg LoadConfig, checkEscape bool) error {
+	debugPinCount = 0
 	t := grp.Selected
 	bi := t.BinInfo()
 	if !t.SupportsFunctionCalls() {
@@ -173,7 +189,7 @@ func EvalExpressionWithCalls(grp *TargetGroup, g *G, expr string, retLoadCfg Loa
 		return err
 	}
 
-	ops, err := evalop.Compile(scopeToEvalLookup{scope}, expr, true)
+	ops, err := evalop.Compile(scopeToEvalLookup{scope}, expr, scope.evalopFlags()|evalop.CanSet)
 	if err != nil {
 		return err
 	}
@@ -187,7 +203,7 @@ func EvalExpressionWithCalls(grp *TargetGroup, g *G, expr string, retLoadCfg Loa
 	}
 
 	stack.eval(scope, ops)
-	if stack.callInjectionContinue {
+	if stack.callInjectionContinue && stack.err == nil {
 		return grp.Continue()
 	}
 
@@ -290,11 +306,19 @@ func (scope *EvalScope) evalCallInjectionStart(op *evalop.CallInjectionStart, st
 		return
 	}
 
+	for _, v := range stack.stack {
+		if v.Flags&(VariableFakeAddress|VariableCPURegister|variableSaved) != 0 || v.Unreadable != nil || v.DwarfType == nil || v.RealType == nil || v.Addr == 0 {
+			continue
+		}
+		saveVariable(v)
+	}
+
 	fncall := functionCallState{
-		expr:          op.Node,
-		savedRegs:     regs,
-		protocolReg:   protocolReg,
-		debugCallName: dbgcallfn.Name,
+		expr:           op.Node,
+		savedRegs:      regs,
+		protocolReg:    protocolReg,
+		debugCallName:  dbgcallfn.Name,
+		hasDebugPinner: scope.BinInfo.hasDebugPinner(),
 	}
 
 	if op.HasFunc {
@@ -366,8 +390,16 @@ func (scope *EvalScope) evalCallInjectionStart(op *evalop.CallInjectionStart, st
 	p.fncallForG[scope.g.ID].startThreadID = thread.ThreadID()
 
 	stack.fncallPush(&fncall)
-	stack.push(newConstant(constant.MakeBool(fncall.fn == nil || fncall.receiver != nil || fncall.closureAddr != 0), scope.Mem))
+	stack.push(newConstant(constant.MakeBool(!fncall.hasDebugPinner && (fncall.fn == nil || fncall.receiver != nil || fncall.closureAddr != 0)), scope.BinInfo, scope.Mem))
 	stack.callInjectionContinue = true
+}
+
+func saveVariable(v *Variable) {
+	v.mem = cacheMemory(v.mem, v.Addr, int(v.RealType.Size()))
+	v.Flags |= variableSaved
+	if cachemem, ok := v.mem.(*memCache); ok {
+		v.Unreadable = cachemem.load()
+	}
 }
 
 func funcCallFinish(scope *EvalScope, stack *evalStack) {
@@ -474,7 +506,7 @@ func funcCallEvalFuncExpr(scope *EvalScope, stack *evalStack, fncall *functionCa
 
 	fnvar := stack.peek()
 	if fnvar.Kind != reflect.Func {
-		return fmt.Errorf("expression %q is not a function", exprToString(fncall.expr.Fun))
+		return fmt.Errorf("expression %q is not a function", astutil.ExprToString(fncall.expr.Fun))
 	}
 	fnvar.loadValue(LoadConfig{false, 0, 0, 0, 0, 0})
 	if fnvar.Unreadable != nil {
@@ -485,7 +517,7 @@ func funcCallEvalFuncExpr(scope *EvalScope, stack *evalStack, fncall *functionCa
 	}
 	fncall.fn = bi.PCToFunc(fnvar.Base)
 	if fncall.fn == nil {
-		return fmt.Errorf("could not find DIE for function %q", exprToString(fncall.expr.Fun))
+		return fmt.Errorf("could not find DIE for function %q", astutil.ExprToString(fncall.expr.Fun))
 	}
 	if !fncall.fn.cu.isgo {
 		return errNotAGoFunction
@@ -508,7 +540,7 @@ func funcCallEvalFuncExpr(scope *EvalScope, stack *evalStack, fncall *functionCa
 	if len(fnvar.Children) > 0 && argnum == (len(fncall.formalArgs)-1) {
 		argnum++
 		fncall.receiver = &fnvar.Children[0]
-		fncall.receiver.Name = exprToString(fncall.expr.Fun)
+		fncall.receiver.Name = astutil.ExprToString(fncall.expr.Fun)
 	}
 
 	if argnum > len(fncall.formalArgs) {
@@ -532,13 +564,14 @@ type funcCallArg struct {
 func funcCallCopyOneArg(scope *EvalScope, fncall *functionCallState, actualArg *Variable, formalArg *funcCallArg, thread Thread) error {
 	if scope.callCtx.checkEscape {
 		//TODO(aarzilli): only apply the escapeCheck to leaking parameters.
-		if err := escapeCheck(actualArg, formalArg.name, scope.g.stack); err != nil {
-			return fmt.Errorf("cannot use %s as argument %s in function %s: %v", actualArg.Name, formalArg.name, fncall.fn.Name, err)
-		}
-		for _, stack := range scope.callCtx.stacks {
-			if err := escapeCheck(actualArg, formalArg.name, stack); err != nil {
-				return fmt.Errorf("cannot use %s as argument %s in function %s: %v", actualArg.Name, formalArg.name, fncall.fn.Name, err)
+		err := allPointers(actualArg, formalArg.name, func(addr uint64, name string) error {
+			if !pointerEscapes(addr, scope.g.stack, scope.callCtx.stacks) {
+				return fmt.Errorf("cannot use %s as argument %s in function %s: stack object passed to escaping pointer: %s", actualArg.Name, formalArg.name, fncall.fn.Name, name)
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 
@@ -573,7 +606,7 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 		return 0, nil, fmt.Errorf("DWARF read error: %v", err)
 	}
 
-	if bi.regabi && fn.cu.optimized {
+	if bi.regabi && fn.Optimized() {
 		if runtimeWhitelist[fn.Name] {
 			runtimeOptimizedWorkaround(bi, fn.cu.image, dwarfTree)
 		} else {
@@ -599,7 +632,7 @@ func funcCallArgs(fn *Function, bi *BinaryInfo, includeRet bool) (argFrameSize i
 		if err != nil {
 			return 0, nil, err
 		}
-		typ = resolveTypedef(typ)
+		typ = godwarf.ResolveTypedef(typ)
 
 		var formalArg *funcCallArg
 		if bi.regabi {
@@ -691,12 +724,13 @@ func alignAddr(addr, align int64) int64 {
 	return (addr + align - 1) &^ (align - 1)
 }
 
-func escapeCheck(v *Variable, name string, stack stack) error {
+// allPointers calls f on every pointer contained in v
+func allPointers(v *Variable, name string, f func(addr uint64, name string) error) error {
 	if v.Unreadable != nil {
 		return fmt.Errorf("escape check for %s failed, variable unreadable: %v", name, v.Unreadable)
 	}
 	switch v.Kind {
-	case reflect.Ptr:
+	case reflect.Ptr, reflect.UnsafePointer:
 		var w *Variable
 		if len(v.Children) == 1 {
 			// this branch is here to support pointers constructed with typecasts from ints or the '&' operator
@@ -704,43 +738,58 @@ func escapeCheck(v *Variable, name string, stack stack) error {
 		} else {
 			w = v.maybeDereference()
 		}
-		return escapeCheckPointer(w.Addr, name, stack)
+		return f(w.Addr, name)
 	case reflect.Chan, reflect.String, reflect.Slice:
-		return escapeCheckPointer(v.Base, name, stack)
+		return f(v.Base, name)
 	case reflect.Map:
 		sv := v.clone()
-		sv.RealType = resolveTypedef(&(v.RealType.(*godwarf.MapType).TypedefType))
+		sv.RealType = godwarf.ResolveTypedef(&(v.RealType.(*godwarf.MapType).TypedefType))
 		sv = sv.maybeDereference()
-		return escapeCheckPointer(sv.Addr, name, stack)
+		return f(sv.Addr, name)
+	case reflect.Interface:
+		sv := v.clone()
+		sv.RealType = godwarf.ResolveTypedef(&(v.RealType.(*godwarf.InterfaceType).TypedefType))
+		sv = sv.maybeDereference()
+		sv.Kind = reflect.Struct
+		return allPointers(sv, name, f)
 	case reflect.Struct:
 		t := v.RealType.(*godwarf.StructType)
 		for _, field := range t.Field {
 			fv, _ := v.toField(field)
-			if err := escapeCheck(fv, fmt.Sprintf("%s.%s", name, field.Name), stack); err != nil {
+			if err := allPointers(fv, fmt.Sprintf("%s.%s", name, field.Name), f); err != nil {
 				return err
 			}
 		}
 	case reflect.Array:
 		for i := int64(0); i < v.Len; i++ {
 			sv, _ := v.sliceAccess(int(i))
-			if err := escapeCheck(sv, fmt.Sprintf("%s[%d]", name, i), stack); err != nil {
+			if err := allPointers(sv, fmt.Sprintf("%s[%d]", name, i), f); err != nil {
 				return err
 			}
 		}
 	case reflect.Func:
-		if err := escapeCheckPointer(v.funcvalAddr(), name, stack); err != nil {
+		if err := f(v.funcvalAddr(), name); err != nil {
 			return err
 		}
+	case reflect.Complex64, reflect.Complex128, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr, reflect.Bool, reflect.Float32, reflect.Float64:
+		// nothing to do
+	default:
+		panic(fmt.Errorf("not implemented: %s", v.Kind))
 	}
 
 	return nil
 }
 
-func escapeCheckPointer(addr uint64, name string, stack stack) error {
+func pointerEscapes(addr uint64, stack stack, stacks []stack) bool {
 	if addr >= stack.lo && addr < stack.hi {
-		return fmt.Errorf("stack object passed to escaping pointer: %s", name)
+		return false
 	}
-	return nil
+	for _, stack := range stacks {
+		if addr >= stack.lo && addr < stack.hi {
+			return false
+		}
+	}
+	return true
 }
 
 const (
@@ -766,7 +815,7 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 	regval := bi.Arch.RegistersToDwarfRegisters(0, regs).Uint64Val(fncall.protocolReg)
 
 	if logflags.FnCall() {
-		loc, _ := thread.Location()
+		loc, _ := ThreadLocation(thread)
 		var pc uint64
 		var fnname string
 		if loc != nil {
@@ -849,7 +898,7 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 			flags |= localsTrustArgOrder
 		}
 
-		fncall.retvars, err = retScope.Locals(flags)
+		fncall.retvars, err = retScope.Locals(flags, "")
 		if err != nil {
 			fncall.err = fmt.Errorf("could not get return values: %v", err)
 			break
@@ -858,28 +907,31 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 			return (v.Flags & VariableReturnArgument) != 0
 		})
 
-		loadValues(fncall.retvars, callScope.callCtx.retLoadCfg)
+		if !fncall.doPinning {
+			loadValues(fncall.retvars, callScope.callCtx.retLoadCfg)
+		}
 		for _, v := range fncall.retvars {
 			v.Flags |= VariableFakeAddress
 		}
 
-		// Store the stack span of the currently running goroutine (which in Go >=
-		// 1.15 might be different from the original injection goroutine) so that
-		// later on we can use it to perform the escapeCheck
-		if threadg, _ := GetG(thread); threadg != nil {
-			callScope.callCtx.stacks = append(callScope.callCtx.stacks, threadg.stack)
-		}
-		if bi.Arch.Name == "arm64" || bi.Arch.Name == "ppc64le" {
-			oldlr, err := readUintRaw(thread.ProcessMemory(), regs.SP(), int64(bi.Arch.PtrSize()))
-			if err != nil {
-				fncall.err = fmt.Errorf("could not restore LR: %v", err)
-				break
+		if fncall.doPinning {
+			stack.callInjectionContinue = false
+			for _, v := range fncall.retvars {
+				saveVariable(v)
+				allPointers(v, "", func(addr uint64, _ string) error {
+					if addr != 0 && pointerEscapes(addr, callScope.g.stack, callScope.callCtx.stacks) {
+						fncall.addrsToPin = append(fncall.addrsToPin, addr)
+					}
+					return nil
+				})
 			}
-			if err = setLR(thread, oldlr); err != nil {
-				fncall.err = fmt.Errorf("could not restore LR: %v", err)
-				break
-			}
+			slices.Sort(fncall.addrsToPin)
+			fncall.addrsToPin = slices.Compact(fncall.addrsToPin)
+
+			return false // will continue with evalop.CallInjectionComplete2
 		}
+
+		callInjectionComplete2(callScope, bi, fncall, regs, thread)
 
 	case debugCallRegReadPanic: // 2
 		// read panic value from stack
@@ -907,10 +959,33 @@ func funcCallStep(callScope *EvalScope, stack *evalStack, thread Thread) bool {
 	return false
 }
 
+func callInjectionComplete2(callScope *EvalScope, bi *BinaryInfo, fncall *functionCallState, regs Registers, thread Thread) {
+	// Store the stack span of the currently running goroutine (which in Go >=
+	// 1.15 might be different from the original injection goroutine) so that
+	// later on we can use it to perform the escapeCheck
+	if threadg, _ := GetG(thread); threadg != nil {
+		callScope.callCtx.stacks = append(callScope.callCtx.stacks, threadg.stack)
+	}
+	if bi.Arch.Name == "arm64" || bi.Arch.Name == "ppc64le" {
+		oldlr, err := readUintRaw(thread.ProcessMemory(), regs.SP(), int64(bi.Arch.PtrSize()))
+		if err != nil {
+			fncall.err = fmt.Errorf("could not restore LR: %v", err)
+			return
+		}
+		if err = setLR(thread, oldlr); err != nil {
+			fncall.err = fmt.Errorf("could not restore LR: %v", err)
+			return
+		}
+	}
+}
+
 func (scope *EvalScope) evalCallInjectionSetTarget(op *evalop.CallInjectionSetTarget, stack *evalStack, thread Thread) {
 	fncall := stack.fncallPeek()
-	if fncall.fn == nil || fncall.receiver != nil || fncall.closureAddr != 0 {
-		funcCallEvalFuncExpr(scope, stack, fncall)
+	if !fncall.hasDebugPinner && (fncall.fn == nil || fncall.receiver != nil || fncall.closureAddr != 0) {
+		stack.err = funcCallEvalFuncExpr(scope, stack, fncall)
+		if stack.err != nil {
+			return
+		}
 	}
 	stack.pop() // target function, consumed by funcCallEvalFuncExpr either above or in evalop.CallInjectionStart
 
@@ -938,7 +1013,7 @@ func (scope *EvalScope) evalCallInjectionSetTarget(op *evalop.CallInjectionSetTa
 	if fncall.receiver != nil {
 		err := funcCallCopyOneArg(scope, fncall, fncall.receiver, &fncall.formalArgs[0], thread)
 		if err != nil {
-			stack.err = err
+			stack.err = fmt.Errorf("could not set call receiver: %v", err)
 			return
 		}
 		fncall.formalArgs = fncall.formalArgs[1:]
@@ -986,92 +1061,59 @@ func fakeFunctionEntryScope(scope *EvalScope, fn *Function, cfa int64, sp uint64
 	return nil
 }
 
-func (scope *EvalScope) allocString(phase int, stack *evalStack, curthread Thread) bool {
-	switch phase {
-	case 0:
-		x := stack.peek()
-		if !(x.Kind == reflect.String && x.Addr == 0 && (x.Flags&VariableConstant) != 0 && x.Len > 0) {
-			stack.opidx += 2 // skip the next two allocString phases, we don't need to do an allocation
-			return false
-		}
-		if scope.callCtx == nil {
-			// do not complain here, setValue will if no other errors happen
-			stack.opidx += 2
-			return false
-		}
-		mallocv, err := scope.findGlobal("runtime", "mallocgc")
-		if mallocv == nil {
-			stack.err = err
-			return false
-		}
-		stack.push(mallocv)
-		scope.evalCallInjectionStart(&evalop.CallInjectionStart{HasFunc: true, Node: &ast.CallExpr{
-			Fun: &ast.SelectorExpr{
-				X:   &ast.Ident{Name: "runtime"},
-				Sel: &ast.Ident{Name: "mallocgc"},
-			},
-			Args: []ast.Expr{
-				&ast.BasicLit{Kind: token.INT, Value: "0"},
-				&ast.Ident{Name: "nil"},
-				&ast.Ident{Name: "false"},
-			},
-		}}, stack)
-		if stack.err == nil {
-			stack.pop() // return value of evalop.CallInjectionStart
-		}
-		return true
-
-	case 1:
-		fncall := stack.fncallPeek()
-		savedLoadCfg := scope.callCtx.retLoadCfg
-		scope.callCtx.retLoadCfg = loadFullValue
-		defer func() {
-			scope.callCtx.retLoadCfg = savedLoadCfg
-		}()
-
-		scope.evalCallInjectionSetTarget(nil, stack, curthread)
-
-		strvar := stack.peek()
-
-		stack.err = funcCallCopyOneArg(scope, fncall, newConstant(constant.MakeInt64(strvar.Len), scope.Mem), &fncall.formalArgs[0], curthread)
-		if stack.err != nil {
-			return false
-		}
-		stack.err = funcCallCopyOneArg(scope, fncall, nilVariable, &fncall.formalArgs[1], curthread)
-		if stack.err != nil {
-			return false
-		}
-		stack.err = funcCallCopyOneArg(scope, fncall, newConstant(constant.MakeBool(false), scope.Mem), &fncall.formalArgs[2], curthread)
-		if stack.err != nil {
-			return false
-		}
-		return true
-
-	case 2:
-		mallocv := stack.pop()
-		v := stack.pop()
-		if mallocv.Unreadable != nil {
-			stack.err = mallocv.Unreadable
-			return false
-		}
-
-		if mallocv.DwarfType.String() != "*void" {
-			stack.err = fmt.Errorf("unexpected return type for mallocgc call: %v", mallocv.DwarfType.String())
-			return false
-		}
-
-		if len(mallocv.Children) != 1 {
-			stack.err = errors.New("internal error, could not interpret return value of mallocgc call")
-			return false
-		}
-
-		v.Base = mallocv.Children[0].Addr
-		_, stack.err = scope.Mem.WriteMemory(v.Base, []byte(constant.StringVal(v.Value)))
-		stack.push(v)
+func (scope *EvalScope) callInjectionStartSpecial(stack *evalStack, op *evalop.CallInjectionStartSpecial, curthread Thread) bool {
+	if op.ComplainAboutStringAlloc && scope.callCtx == nil {
+		stack.err = errFuncCallNotAllowedStrAlloc
 		return false
 	}
+	fnv, err := scope.findGlobalInternal(op.FnName)
+	if fnv == nil {
+		if err == nil {
+			if op.ComplainAboutStringAlloc {
+				err = errFuncCallNotAllowedStrAlloc
+			} else {
+				err = fmt.Errorf("function %s not found", op.FnName)
+			}
+		}
+		stack.err = err
+		return false
+	}
+	stack.push(fnv)
+	scope.evalCallInjectionStart(&evalop.CallInjectionStart{HasFunc: true, Node: &ast.CallExpr{
+		Fun:  &ast.Ident{Name: op.FnName},
+		Args: op.ArgAst,
+	}}, stack)
+	if stack.err == nil {
+		stack.pop() // return value of evalop.CallInjectionStart
+		return true
+	}
+	return false
+}
 
-	panic("unreachable")
+func (scope *EvalScope) convertAllocToString(stack *evalStack) {
+	mallocv := stack.pop()
+	v := stack.pop()
+
+	mallocv.loadValue(loadFullValue)
+
+	if mallocv.Unreadable != nil {
+		stack.err = mallocv.Unreadable
+		return
+	}
+
+	if mallocv.DwarfType.String() != "*void" {
+		stack.err = fmt.Errorf("unexpected return type for mallocgc call: %v", mallocv.DwarfType.String())
+		return
+	}
+
+	if len(mallocv.Children) != 1 {
+		stack.err = errors.New("internal error, could not interpret return value of mallocgc call")
+		return
+	}
+
+	v.Base = mallocv.Children[0].Addr
+	_, stack.err = scope.Mem.WriteMemory(v.Base, []byte(constant.StringVal(v.Value)))
+	stack.push(v)
 }
 
 func isCallInjectionStop(t *Target, thread Thread, loc *Location) bool {
@@ -1099,7 +1141,7 @@ func isCallInjectionStop(t *Target, thread Thread, loc *Location) bool {
 // callInjectionProtocol is the function called from Continue to progress
 // the injection protocol for all threads.
 // Returns true if a call injection terminated
-func callInjectionProtocol(t *Target, threads []Thread) (done bool, err error) {
+func callInjectionProtocol(t *Target, trapthread Thread, threads []Thread) (done bool, err error) {
 	if len(t.fncallForG) == 0 {
 		// we aren't injecting any calls, no need to check the threads.
 		return false, nil
@@ -1109,8 +1151,11 @@ func callInjectionProtocol(t *Target, threads []Thread) (done bool, err error) {
 		t.currentThread = currentThread
 	}()
 	for _, thread := range threads {
-		loc, err := thread.Location()
+		loc, err := ThreadLocation(thread)
 		if err != nil {
+			continue
+		}
+		if (thread.ThreadID() != trapthread.ThreadID()) && !thread.SoftExc() {
 			continue
 		}
 		if !isCallInjectionStop(t, thread, loc) {
@@ -1221,7 +1266,10 @@ func debugCallProtocolReg(archName string, version int) (uint64, bool) {
 // runtimeWhitelist is a list of functions in the runtime that we can call
 // (through call injection) even if they are optimized.
 var runtimeWhitelist = map[string]bool{
-	"runtime.mallocgc": true,
+	"runtime.mallocgc":             true,
+	evalop.DebugPinnerFunctionName: true,
+	"runtime.(*Pinner).Unpin":      true,
+	"runtime.(*Pinner).Pin":        true,
 }
 
 // runtimeOptimizedWorkaround modifies the input DIE so that arguments and

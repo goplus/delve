@@ -2,6 +2,7 @@ package godwarf
 
 import (
 	"debug/dwarf"
+	"errors"
 	"fmt"
 	"sort"
 )
@@ -39,7 +40,7 @@ func (ce compositeEntry) AttrField(a dwarf.Attr) *dwarf.Field {
 // DWARF standard is unclear on how this should be handled
 func LoadAbstractOriginAndSpecification(entry *dwarf.Entry, aordr *dwarf.Reader) (Entry, dwarf.Offset) {
 	ao, ok := getAbstractOriginOrSpecification(entry)
-	if !ok {
+	if !ok || ao == entry.Offset {
 		return entry, entry.Offset
 	}
 
@@ -54,7 +55,7 @@ func LoadAbstractOriginAndSpecification(entry *dwarf.Entry, aordr *dwarf.Reader)
 		r = append(r, e)
 
 		ao, ok = getAbstractOriginOrSpecification(e)
-		if !ok {
+		if !ok || ao == entry.Offset {
 			break
 		}
 	}
@@ -90,6 +91,9 @@ type Tree struct {
 // range of addresses that is not covered by its parent LoadTree will fix
 // the parent entry.
 func LoadTree(off dwarf.Offset, dw *dwarf.Data, staticBase uint64) (*Tree, error) {
+	if dw == nil {
+		return nil, errors.New("unable to load DWARF tree: no DWARF information present")
+	}
 	rdr := dw.Reader()
 	rdr.Seek(off)
 
@@ -274,7 +278,7 @@ func (n *Tree) Type(dw *dwarf.Data, index int, typeCache map[dwarf.Offset]Type) 
 	if n.typ == nil {
 		offset, ok := n.Val(dwarf.AttrType).(dwarf.Offset)
 		if !ok {
-			return nil, fmt.Errorf("malformed variable DIE (offset)")
+			return nil, errors.New("malformed variable DIE (offset)")
 		}
 
 		var err error

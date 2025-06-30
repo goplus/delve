@@ -1,20 +1,19 @@
 package proc
 
 import (
-	"bytes"
 	"debug/dwarf"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/constant"
 	"go/parser"
-	"go/printer"
 	"go/token"
 	"reflect"
 	"runtime/debug"
 	"sort"
 	"strings"
 
+	"github.com/go-delve/delve/pkg/astutil"
 	"github.com/go-delve/delve/pkg/dwarf/godwarf"
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/dwarf/reader"
@@ -25,7 +24,10 @@ import (
 
 var errOperationOnSpecialFloat = errors.New("operations on non-finite floats not implemented")
 
-const goDictionaryName = ".dict"
+const (
+	goDictionaryName = ".dict"
+	goClosurePtr     = ".closureptr"
+)
 
 // EvalScope is the scope for variable evaluation. Contains the thread,
 // current location (PC), and canonical frame address.
@@ -48,6 +50,9 @@ type EvalScope struct {
 	callCtx *callContext
 
 	dictAddr uint64 // dictionary address for instantiated generic functions
+
+	enclosingRangeScopes []*EvalScope
+	rangeFrames          []Stackframe
 }
 
 type localsFlags uint8
@@ -61,6 +66,14 @@ const (
 	// If localsNoDeclLineCheck the declaration line isn't checked at
 	// all to determine if the variable is in scope.
 	localsNoDeclLineCheck
+
+	// If localsOnlyRangeBodyClosures is set simpleLocals only returns
+	// variables containing the range body closure.
+	localsOnlyRangeBodyClosures
+
+	// If localsIsRangeBody is set DW_AT_formal_parameter variables will be
+	// considered local variables.
+	localsIsRangeBody
 )
 
 // ConvertEvalScope returns a new EvalScope in the context of the
@@ -172,9 +185,17 @@ func GoroutineScope(t *Target, thread Thread) (*EvalScope, error) {
 	return FrameToScope(t, thread.ProcessMemory(), g, threadID, locations...), nil
 }
 
+func (scope *EvalScope) evalopFlags() evalop.Flags {
+	flags := evalop.Flags(0)
+	if scope.BinInfo.hasDebugPinner() {
+		flags |= evalop.HasDebugPinner
+	}
+	return flags
+}
+
 // EvalExpression returns the value of the given expression.
 func (scope *EvalScope) EvalExpression(expr string, cfg LoadConfig) (*Variable, error) {
-	ops, err := evalop.Compile(scopeToEvalLookup{scope}, expr, false)
+	ops, err := evalop.Compile(scopeToEvalLookup{scope}, expr, scope.evalopFlags())
 	if err != nil {
 		return nil, err
 	}
@@ -203,83 +224,12 @@ func (s scopeToEvalLookup) FindTypeExpr(expr ast.Expr) (godwarf.Type, error) {
 	return s.BinInfo.findTypeExpr(expr)
 }
 
-func (scope scopeToEvalLookup) HasLocal(name string) bool {
-	if scope.Fn == nil {
-		return false
-	}
-
-	flags := reader.VariablesOnlyVisible
-	if scope.BinInfo.Producer() != "" && goversion.ProducerAfterOrEqual(scope.BinInfo.Producer(), 1, 15) {
-		flags |= reader.VariablesTrustDeclLine
-	}
-
-	dwarfTree, err := scope.image().getDwarfTree(scope.Fn.offset)
-	if err != nil {
-		return false
-	}
-
-	varEntries := reader.Variables(dwarfTree, scope.PC, scope.Line, flags)
-	for _, entry := range varEntries {
-		curname, _ := entry.Val(dwarf.AttrName).(string)
-		if curname == name {
-			return true
-		}
-		if len(curname) > 0 && curname[0] == '&' {
-			if curname[1:] == name {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (scope scopeToEvalLookup) HasGlobal(pkgName, varName string) bool {
-	hasGlobalInternal := func(name string) bool {
-		for _, pkgvar := range scope.BinInfo.packageVars {
-			if pkgvar.name == name || strings.HasSuffix(pkgvar.name, "/"+name) {
-				return true
-			}
-		}
-		for _, fn := range scope.BinInfo.Functions {
-			if fn.Name == name || strings.HasSuffix(fn.Name, "/"+name) {
-				return true
-			}
-		}
-		for _, ctyp := range scope.BinInfo.consts {
-			for _, cval := range ctyp.values {
-				if cval.fullName == name || strings.HasSuffix(cval.fullName, "/"+name) {
-					return true
-				}
-			}
-		}
-		return false
-	}
-
-	if pkgName == "" {
-		if scope.Fn == nil {
-			return false
-		}
-		return hasGlobalInternal(scope.Fn.PackageName() + "." + varName)
-	}
-
-	for _, pkgPath := range scope.BinInfo.PackageMap[pkgName] {
-		if hasGlobalInternal(pkgPath + "." + varName) {
-			return true
-		}
-	}
-	return hasGlobalInternal(pkgName + "." + varName)
-}
-
-func (scope scopeToEvalLookup) LookupRegisterName(name string) (int, bool) {
-	s := validRegisterName(name)
-	if s == "" {
-		return 0, false
-	}
-	return scope.BinInfo.Arch.RegisterNameToDwarf(s)
-}
-
 func (scope scopeToEvalLookup) HasBuiltin(name string) bool {
 	return supportedBuiltins[name] != nil
+}
+
+func (scope scopeToEvalLookup) PtrSize() int {
+	return scope.BinInfo.Arch.ptrSize
 }
 
 // ChanGoroutines returns the list of goroutines waiting to receive from or
@@ -365,10 +315,111 @@ func (scope *EvalScope) ChanGoroutines(expr string, start, count int) ([]int64, 
 	return goids, nil
 }
 
-// Locals returns all variables in 'scope'.
-func (scope *EvalScope) Locals(flags localsFlags) ([]*Variable, error) {
+// Locals returns all variables in 'scope' named wantedName, or all of them
+// if wantedName is "".
+// If scope is the scope for a range-over-func closure body it will merge in
+// the scopes of the enclosing functions.
+func (scope *EvalScope) Locals(flags localsFlags, wantedName string) ([]*Variable, error) {
+	var scopes [][]*Variable
+	filter := func(vars []*Variable) []*Variable {
+		if wantedName == "" || vars == nil {
+			return vars
+		}
+		vars2 := []*Variable{}
+		for _, v := range vars {
+			if v.Name == wantedName {
+				vars2 = append(vars2, v)
+			}
+		}
+		return vars2
+	}
+
+	rangeBodyFlags := localsFlags(0)
+	if scope.Fn != nil && scope.Fn.rangeParentName() != "" {
+		rangeBodyFlags = localsFlags(localsIsRangeBody)
+	}
+
+	vars0, err := scope.simpleLocals(flags|rangeBodyFlags, wantedName)
+	if err != nil {
+		return nil, err
+	}
+	vars0 = filter(vars0)
+	if scope.Fn.extra(scope.BinInfo).rangeParent == nil || scope.target == nil || scope.g == nil {
+		return vars0, nil
+	}
+	if wantedName != "" && len(vars0) > 0 {
+		return vars0, nil
+	}
+
+	scopes = append(scopes, vars0)
+
+	if scope.rangeFrames == nil {
+		err := scope.setupRangeFrames()
+		if err != nil {
+			return nil, err
+		}
+	}
+	for i, scope2 := range scope.enclosingRangeScopes {
+		if scope2 == nil {
+			scope2 = FrameToScope(scope.target, scope.target.Memory(), scope.g, scope.threadID, scope.rangeFrames[2*i:]...)
+			scope.enclosingRangeScopes[i] = scope2
+		}
+		rangeBodyFlags := localsFlags(localsIsRangeBody)
+		if i == len(scope.enclosingRangeScopes)-1 {
+			rangeBodyFlags = 0
+		}
+		vars, err := scope2.simpleLocals(flags|rangeBodyFlags, wantedName)
+		if err != nil {
+			return nil, err
+		}
+		vars = filter(vars)
+		scopes = append(scopes, vars)
+		if wantedName != "" && len(vars) > 0 {
+			return vars, nil
+		}
+	}
+
+	vars := []*Variable{}
+	for i := len(scopes) - 1; i >= 0; i-- {
+		vars = append(vars, scopes[i]...)
+	}
+
+	// Apply shadowning
+	lvn := map[string]*Variable{}
+	for _, v := range vars {
+		if otherv := lvn[v.Name]; otherv != nil {
+			otherv.Flags |= VariableShadowed
+		}
+		lvn[v.Name] = v
+	}
+	return vars, nil
+}
+
+func (scope *EvalScope) setupRangeFrames() error {
+	var err error
+	scope.rangeFrames, err = rangeFuncStackTrace(scope.target, scope.g)
+	if err != nil {
+		return err
+	}
+	if len(scope.rangeFrames) > 0 {
+		scope.rangeFrames = scope.rangeFrames[2:] // skip the first frame and its return frame
+	}
+	scope.enclosingRangeScopes = make([]*EvalScope, len(scope.rangeFrames)/2)
+	return nil
+}
+
+// simpleLocals returns all local variables in 'scope'.
+// This function does not try to merge the scopes of range-over-func closure
+// bodies with their enclosing function, for that use (*EvalScope).Locals or
+// (*EvalScope).FindLocal instead.
+// If wantedName is specified only variables called wantedName or "&"+wantedName are returned.
+func (scope *EvalScope) simpleLocals(flags localsFlags, wantedName string) ([]*Variable, error) {
 	if scope.Fn == nil {
 		return nil, errors.New("unable to find function context")
+	}
+
+	if scope.image().Stripped() {
+		return nil, errors.New("unable to find locals: no debug information present in binary")
 	}
 
 	trustArgOrder := (flags&localsTrustArgOrder != 0) && scope.BinInfo.Producer() != "" && goversion.ProducerAfterOrEqual(scope.BinInfo.Producer(), 1, 12) && scope.Fn != nil && (scope.PC == scope.Fn.Entry)
@@ -378,7 +429,7 @@ func (scope *EvalScope) Locals(flags localsFlags) ([]*Variable, error) {
 		return nil, err
 	}
 
-	variablesFlags := reader.VariablesOnlyVisible
+	variablesFlags := reader.VariablesOnlyVisible | reader.VariablesSkipInlinedSubroutines
 	if flags&localsNoDeclLineCheck != 0 {
 		variablesFlags = reader.VariablesNoDeclLineCheck
 	}
@@ -390,29 +441,29 @@ func (scope *EvalScope) Locals(flags localsFlags) ([]*Variable, error) {
 
 	// look for dictionary entry
 	if scope.dictAddr == 0 {
-		for _, entry := range varEntries {
-			name, _ := entry.Val(dwarf.AttrName).(string)
-			if name == goDictionaryName {
-				dictVar, err := extractVarInfoFromEntry(scope.target, scope.BinInfo, scope.image(), scope.Regs, scope.Mem, entry.Tree, 0)
-				if err != nil {
-					logflags.DebuggerLogger().Errorf("could not load %s variable: %v", name, err)
-				} else if dictVar.Unreadable != nil {
-					logflags.DebuggerLogger().Errorf("could not load %s variable: %v", name, dictVar.Unreadable)
-				} else {
-					scope.dictAddr, err = readUintRaw(dictVar.mem, dictVar.Addr, int64(scope.BinInfo.Arch.PtrSize()))
-					if err != nil {
-						logflags.DebuggerLogger().Errorf("could not load %s variable: %v", name, err)
-					}
-				}
-				break
-			}
-		}
+		scope.dictAddr = readLocalPtrVar(dwarfTree, goDictionaryName, scope.target, scope.BinInfo, scope.image(), scope.Regs, scope.Mem)
 	}
 
 	vars := make([]*Variable, 0, len(varEntries))
 	depths := make([]int, 0, len(varEntries))
 	for _, entry := range varEntries {
-		if name, _ := entry.Val(dwarf.AttrName).(string); name == goDictionaryName {
+		name, _ := entry.Val(dwarf.AttrName).(string)
+		switch {
+		case wantedName != "":
+			if name != wantedName && name != "&"+wantedName {
+				continue
+			}
+		case flags&localsOnlyRangeBodyClosures != 0:
+			if !strings.HasPrefix(name, "#yield") && !strings.HasPrefix(name, "&#yield") {
+				continue
+			}
+		default:
+			if name == goDictionaryName || name == goClosurePtr || strings.HasPrefix(name, "#yield") || strings.HasPrefix(name, "&#yield") {
+				continue
+			}
+		}
+		if scope.Fn.rangeParentName() != "" && (strings.HasPrefix(name, "~") || entry.Val(godwarf.AttrGoClosureOffset) != nil) {
+			// Skip unnamed parameters and closure variables for range-over-func closure bodies
 			continue
 		}
 		val, err := extractVarInfoFromEntry(scope.target, scope.BinInfo, scope.image(), scope.Regs, scope.Mem, entry.Tree, scope.dictAddr)
@@ -430,7 +481,7 @@ func (scope *EvalScope) Locals(flags localsFlags) ([]*Variable, error) {
 		}
 		vars = append(vars, val)
 		depth := entry.Depth
-		if entry.Tag == dwarf.TagFormalParameter {
+		if (flags&localsIsRangeBody == 0) && (entry.Tag == dwarf.TagFormalParameter) {
 			if depth <= 1 {
 				depth = 0
 			}
@@ -458,7 +509,7 @@ func (scope *EvalScope) Locals(flags localsFlags) ([]*Variable, error) {
 			declLine := v.DeclLine
 			v = v.maybeDereference()
 			if v.Addr == 0 && v.Unreadable == nil {
-				v.Unreadable = fmt.Errorf("no address for escaped variable")
+				v.Unreadable = errors.New("no address for escaped variable")
 			}
 			v.Name = name[1:]
 			v.Flags |= VariableEscaped
@@ -484,6 +535,31 @@ func afterLastArgAddr(vars []*Variable) uint64 {
 		v := vars[i]
 		if (v.Flags&VariableArgument != 0) || (v.Flags&VariableReturnArgument != 0) {
 			return v.Addr + uint64(v.DwarfType.Size())
+		}
+	}
+	return 0
+}
+
+// readLocalPtrVar reads the value of the local pointer variable vname. This
+// is a low level helper function, it does not support nested scopes, range
+// resolution across range bodies, type parameters, &c...
+func readLocalPtrVar(dwarfTree *godwarf.Tree, vname string, tgt *Target, bi *BinaryInfo, image *Image, regs op.DwarfRegisters, mem MemoryReadWriter) uint64 {
+	for _, entry := range dwarfTree.Children {
+		name, _ := entry.Val(dwarf.AttrName).(string)
+		if name == vname {
+			v, err := extractVarInfoFromEntry(tgt, bi, image, regs, mem, entry, 0)
+			if err != nil {
+				logflags.DebuggerLogger().Errorf("could not load %s variable: %v", name, err)
+			} else if v.Unreadable != nil {
+				logflags.DebuggerLogger().Errorf("could not load %s variable: %v", name, v.Unreadable)
+			} else {
+				r, err := readUintRaw(v.mem, v.Addr, int64(bi.Arch.PtrSize()))
+				if err != nil {
+					logflags.DebuggerLogger().Errorf("could not load %s variable: %v", name, err)
+				}
+				return r
+			}
+			break
 		}
 	}
 	return 0
@@ -577,7 +653,7 @@ func (scope *EvalScope) setValue(dstv, srcv *Variable, srcExpr string) error {
 
 // SetVariable sets the value of the named variable
 func (scope *EvalScope) SetVariable(name, value string) error {
-	ops, err := evalop.CompileSet(scopeToEvalLookup{scope}, name, value)
+	ops, err := evalop.CompileSet(scopeToEvalLookup{scope}, name, value, scope.evalopFlags())
 	if err != nil {
 		return err
 	}
@@ -590,7 +666,7 @@ func (scope *EvalScope) SetVariable(name, value string) error {
 
 // LocalVariables returns all local variables from the current function scope.
 func (scope *EvalScope) LocalVariables(cfg LoadConfig) ([]*Variable, error) {
-	vars, err := scope.Locals(0)
+	vars, err := scope.Locals(0, "")
 	if err != nil {
 		return nil, err
 	}
@@ -604,7 +680,7 @@ func (scope *EvalScope) LocalVariables(cfg LoadConfig) ([]*Variable, error) {
 
 // FunctionArguments returns the name, value, and type of all current function arguments.
 func (scope *EvalScope) FunctionArguments(cfg LoadConfig) ([]*Variable, error) {
-	vars, err := scope.Locals(0)
+	vars, err := scope.Locals(0, "")
 	if err != nil {
 		return nil, err
 	}
@@ -676,7 +752,20 @@ func (scope *EvalScope) findGlobal(pkgName, varName string) (*Variable, error) {
 	if err != nil || v != nil {
 		return v, err
 	}
-	return nil, fmt.Errorf("could not find symbol value for %s.%s", pkgName, varName)
+	return nil, &errCouldNotFindSymbol{fmt.Sprintf("%s.%s", pkgName, varName)}
+}
+
+type errCouldNotFindSymbol struct {
+	name string
+}
+
+func (e *errCouldNotFindSymbol) Error() string {
+	return fmt.Sprintf("could not find symbol %s", e.name)
+}
+
+func isSymbolNotFound(e error) bool {
+	var e2 *errCouldNotFindSymbol
+	return errors.As(e, &e2)
 }
 
 func (scope *EvalScope) findGlobalInternal(name string) (*Variable, error) {
@@ -750,9 +839,13 @@ type evalStack struct {
 	scope               *EvalScope
 	curthread           Thread
 	lastRetiredFncall   *functionCallState
+	debugPinner         *Variable
 }
 
 func (s *evalStack) push(v *Variable) {
+	if v == nil {
+		panic(errors.New("internal debugger error, nil pushed onto variables stack"))
+	}
 	s.stack = append(s.stack, v)
 }
 
@@ -841,6 +934,8 @@ func (stack *evalStack) resume(g *G) {
 	scope.Regs.FrameBase = stack.fboff + int64(scope.g.stack.hi)
 	scope.Regs.CFA = scope.frameOffset + int64(scope.g.stack.hi)
 	stack.curthread = g.Thread
+	scope.rangeFrames = nil
+	scope.enclosingRangeScopes = nil
 
 	finished := funcCallStep(scope, stack, g.Thread)
 	if finished {
@@ -854,6 +949,20 @@ func (stack *evalStack) resume(g *G) {
 	}
 
 	// call injection protocol suspended or concluded, resume normal opcode execution
+	if len(stack.fncalls) == 0 && g.Thread != nil {
+		// The function call protocol concluded, recover the thread's registers so
+		// we can use them to evaluate variables.
+		so := scope.image()
+		if regs, err := g.Thread.Registers(); err == nil {
+			cfa := scope.Regs.CFA
+			frameBase := scope.Regs.FrameBase
+			dwarfRegs := *(scope.BinInfo.Arch.RegistersToDwarfRegisters(so.StaticBase, regs))
+			dwarfRegs.ChangeFunc = g.Thread.SetReg
+			scope.Regs = dwarfRegs
+			scope.Regs.CFA = cfa
+			scope.Regs.FrameBase = frameBase
+		}
+	}
 	stack.run()
 }
 
@@ -864,7 +973,7 @@ func (stack *evalStack) run() {
 		stack.executeOp()
 		// If the instruction we just executed requests the call injection
 		// protocol by setting callInjectionContinue we switch to it.
-		if stack.callInjectionContinue {
+		if stack.callInjectionContinue && stack.err == nil {
 			scope.callCtx.injectionThread = nil
 			return
 		}
@@ -879,25 +988,35 @@ func (stack *evalStack) run() {
 	// injections before returning.
 
 	if len(stack.fncalls) > 0 {
+		fncallLog("undoing calls (%v)", stack.err)
 		fncall := stack.fncallPeek()
 		if fncall == stack.lastRetiredFncall {
 			stack.err = fmt.Errorf("internal debugger error: could not undo injected call during error recovery, original error: %v", stack.err)
 			return
 		}
 		if fncall.undoInjection != nil {
-			// setTargetExecuted is set if evalop.CallInjectionSetTarget has been
-			// executed but evalop.CallInjectionComplete hasn't, we must undo the callOP
-			// call in evalop.CallInjectionSetTarget before continuing.
-			switch scope.BinInfo.Arch.Name {
-			case "amd64":
-				regs, _ := curthread.Registers()
-				setSP(curthread, regs.SP()+uint64(scope.BinInfo.Arch.PtrSize()))
-				setPC(curthread, fncall.undoInjection.oldpc)
-			case "arm64", "ppc64le":
-				setLR(curthread, fncall.undoInjection.oldlr)
-				setPC(curthread, fncall.undoInjection.oldpc)
-			default:
-				panic("not implemented")
+			if fncall.undoInjection.doComplete2 {
+				// doComplete2 is set if CallInjectionComplete{DoPinning: true} has been
+				// executed but CallInjectionComplete2 hasn't.
+				regs, err := curthread.Registers()
+				if err == nil {
+					callInjectionComplete2(scope, scope.BinInfo, fncall, regs, curthread)
+				}
+			} else {
+				// undoInjection is set if evalop.CallInjectionSetTarget has been
+				// executed but evalop.CallInjectionComplete hasn't, we must undo the callOP
+				// call in evalop.CallInjectionSetTarget before continuing.
+				switch scope.BinInfo.Arch.Name {
+				case "amd64":
+					regs, _ := curthread.Registers()
+					setSP(curthread, regs.SP()+uint64(scope.BinInfo.Arch.PtrSize()))
+					setPC(curthread, fncall.undoInjection.oldpc)
+				case "arm64", "ppc64le":
+					setLR(curthread, fncall.undoInjection.oldlr)
+					setPC(curthread, fncall.undoInjection.oldpc)
+				default:
+					panic("not implemented")
+				}
 			}
 		}
 		stack.lastRetiredFncall = fncall
@@ -932,6 +1051,7 @@ func (stack *evalStack) executeOp() {
 	defer func() {
 		err := recover()
 		if err != nil {
+			logflags.Bug.Inc()
 			stack.err = fmt.Errorf("internal debugger error: %v (recovered)\n%s", err, string(debug.Stack()))
 		}
 	}()
@@ -948,46 +1068,32 @@ func (stack *evalStack) executeOp() {
 			gvar := newVariable("curg", fakeAddressUnresolv, typ, scope.BinInfo, scope.Mem)
 			gvar.loaded = true
 			gvar.Flags = VariableFakeAddress
-			gvar.Children = append(gvar.Children, *newConstant(constant.MakeInt64(0), scope.Mem))
+			gvar.Children = append(gvar.Children, *newConstant(constant.MakeInt64(0), scope.BinInfo, scope.Mem))
 			gvar.Children[0].Name = "goid"
 			stack.push(gvar)
 		}
 
 	case *evalop.PushFrameoff:
-		stack.push(newConstant(constant.MakeInt64(scope.frameOffset), scope.Mem))
+		stack.push(newConstant(constant.MakeInt64(scope.frameOffset), scope.BinInfo, scope.Mem))
+
+	case *evalop.PushRangeParentOffset:
+		if scope.rangeFrames == nil {
+			stack.err = scope.setupRangeFrames()
+		}
+		if len(scope.rangeFrames) > 0 {
+			stack.push(newConstant(constant.MakeInt64(scope.rangeFrames[len(scope.rangeFrames)-2].FrameOffset()), scope.BinInfo, scope.Mem))
+		} else {
+			stack.push(newConstant(constant.MakeInt64(0), scope.BinInfo, scope.Mem))
+		}
 
 	case *evalop.PushThreadID:
-		stack.push(newConstant(constant.MakeInt64(int64(scope.threadID)), scope.Mem))
+		stack.push(newConstant(constant.MakeInt64(int64(scope.threadID)), scope.BinInfo, scope.Mem))
 
 	case *evalop.PushConst:
-		stack.push(newConstant(op.Value, scope.Mem))
+		stack.push(newConstant(op.Value, scope.BinInfo, scope.Mem))
 
 	case *evalop.PushLocal:
-		var vars []*Variable
-		var err error
-		if op.Frame != 0 {
-			var frameScope *EvalScope
-			frameScope, err = ConvertEvalScope(scope.target, scope.g.ID, int(op.Frame), 0)
-			if err != nil {
-				stack.err = err
-				return
-			}
-			vars, err = frameScope.Locals(0)
-		} else {
-			vars, err = scope.Locals(0)
-		}
-		if err != nil {
-			stack.err = err
-			return
-		}
-		found := false
-		for i := range vars {
-			if vars[i].Name == op.Name && vars[i].Flags&VariableShadowed == 0 {
-				stack.push(vars[i])
-				found = true
-				break
-			}
-		}
+		found := stack.pushLocal(scope, op.Name, op.Frame)
 		if !found {
 			stack.err = fmt.Errorf("could not find symbol value for %s", op.Name)
 		}
@@ -995,52 +1101,39 @@ func (stack *evalStack) executeOp() {
 	case *evalop.PushNil:
 		stack.push(nilVariable)
 
-	case *evalop.PushRegister:
-		reg := scope.Regs.Reg(uint64(op.Regnum))
-		if reg == nil {
-			stack.err = fmt.Errorf("could not find symbol value for %s", op.Regname)
-			return
-		}
-		reg.FillBytes()
-
-		var typ godwarf.Type
-		if len(reg.Bytes) <= 8 {
-			typ = godwarf.FakeBasicType("uint", 64)
-		} else {
-			var err error
-			typ, err = scope.BinInfo.findType("string")
-			if err != nil {
-				stack.err = err
-				return
-			}
-		}
-
-		v := newVariable(op.Regname, 0, typ, scope.BinInfo, scope.Mem)
-		if v.Kind == reflect.String {
-			v.Len = int64(len(reg.Bytes) * 2)
-			v.Base = fakeAddressUnresolv
-		}
-		v.Addr = fakeAddressUnresolv
-		v.Flags = VariableCPURegister
-		v.reg = reg
-		stack.push(v)
-
-	case *evalop.PushPackageVar:
-		pkgName := op.PkgName
-		replaceName := false
-		if pkgName == "" {
-			replaceName = true
-			pkgName = scope.Fn.PackageName()
-		}
-		v, err := scope.findGlobal(pkgName, op.Name)
-		if err != nil {
+	case *evalop.PushPackageVarOrSelect:
+		v, err := scope.findGlobal(op.Name, op.Sel)
+		if err != nil && !isSymbolNotFound(err) {
 			stack.err = err
 			return
 		}
-		if replaceName {
-			v.Name = op.Name
+		if v != nil {
+			stack.push(v)
+		} else {
+			if op.NameIsString {
+				stack.err = fmt.Errorf("%q (type string) is not a struct", op.Name)
+				return
+			}
+			found := stack.pushIdent(scope, op.Name)
+			if stack.err != nil {
+				return
+			}
+			if found {
+				scope.evalStructSelector(&evalop.Select{Name: op.Sel}, stack)
+			} else {
+				stack.err = fmt.Errorf("could not find symbol value for %s", op.Name)
+			}
 		}
-		stack.push(v)
+
+	case *evalop.PushIdent:
+		found := stack.pushIdent(scope, op.Name)
+		if !found {
+			stack.err = fmt.Errorf("could not find symbol value for %s", op.Name)
+		}
+
+	case *evalop.PushLen:
+		v := stack.peek()
+		stack.push(newConstant(constant.MakeInt64(v.Len), scope.BinInfo, scope.Mem))
 
 	case *evalop.Select:
 		scope.evalStructSelector(op, stack)
@@ -1079,10 +1172,19 @@ func (stack *evalStack) executeOp() {
 			return
 		}
 		x.loadValue(loadFullValue)
-		stack.push(newConstant(x.Value, scope.Mem))
+		stack.push(newConstant(x.Value, scope.BinInfo, scope.Mem))
 
 	case *evalop.Pop:
 		stack.pop()
+
+	case *evalop.Roll:
+		rolled := stack.stack[len(stack.stack)-op.N-1]
+		copy(stack.stack[len(stack.stack)-op.N-1:], stack.stack[len(stack.stack)-op.N:])
+		stack.stack[len(stack.stack)-1] = rolled
+
+	case *evalop.Dup:
+		x := stack.stack[len(stack.stack)-1]
+		stack.push(x)
 
 	case *evalop.BuiltinCall:
 		vars := make([]*Variable, len(op.Args))
@@ -1101,21 +1203,84 @@ func (stack *evalStack) executeOp() {
 		fncall := stack.fncallPeek()
 		actualArg := stack.pop()
 		if actualArg.Name == "" {
-			actualArg.Name = exprToString(op.ArgExpr)
+			actualArg.Name = astutil.ExprToString(op.ArgExpr)
 		}
 		stack.err = funcCallCopyOneArg(scope, fncall, actualArg, &fncall.formalArgs[op.ArgNum], curthread)
 
 	case *evalop.CallInjectionComplete:
-		stack.fncallPeek().undoInjection = nil
+		fncall := stack.fncallPeek()
+		fncall.doPinning = op.DoPinning
+		if op.DoPinning {
+			fncall.undoInjection.doComplete2 = true
+		} else {
+			fncall.undoInjection = nil
+		}
 		stack.callInjectionContinue = true
 
-	case *evalop.CallInjectionAllocString:
-		stack.callInjectionContinue = scope.allocString(op.Phase, stack, curthread)
+	case *evalop.CallInjectionComplete2:
+		fncall := stack.fncallPeek()
+		if len(fncall.addrsToPin) != 0 {
+			stack.err = fmt.Errorf("internal debugger error: CallInjectionComplete2 called when there still are addresses to pin")
+		}
+		fncall.undoInjection = nil
+		regs, err := curthread.Registers()
+		if err == nil {
+			callInjectionComplete2(scope, scope.BinInfo, fncall, regs, curthread)
+			stack.callInjectionContinue = true
+		} else {
+			stack.err = err
+		}
+
+	case *evalop.CallInjectionStartSpecial:
+		stack.callInjectionContinue = scope.callInjectionStartSpecial(stack, op, curthread)
+
+	case *evalop.ConvertAllocToString:
+		scope.convertAllocToString(stack)
 
 	case *evalop.SetValue:
 		lhv := stack.pop()
 		rhv := stack.pop()
-		stack.err = scope.setValue(lhv, rhv, exprToString(op.Rhe))
+		stack.err = scope.setValue(lhv, rhv, astutil.ExprToString(op.Rhe))
+
+	case *evalop.PushPinAddress:
+		debugPinCount++
+		fncall := stack.fncallPeek()
+		addrToPin := fncall.addrsToPin[len(fncall.addrsToPin)-1]
+		fncall.addrsToPin = fncall.addrsToPin[:len(fncall.addrsToPin)-1]
+		typ, err := scope.BinInfo.findType("unsafe.Pointer")
+		if ptyp, ok := typ.(*godwarf.PtrType); err == nil && ok {
+			v := newVariable("", 0, typ, scope.BinInfo, scope.Mem)
+			v.Children = []Variable{*(newVariable("", uint64(addrToPin), ptyp.Type, scope.BinInfo, scope.Mem))}
+			stack.push(v)
+		} else {
+			stack.err = fmt.Errorf("can not pin address: %v", err)
+		}
+
+	case *evalop.SetDebugPinner:
+		stack.debugPinner = stack.pop()
+
+	case *evalop.PushDebugPinner:
+		stack.push(stack.debugPinner)
+
+	case *evalop.PushBreakpointHitCount:
+		stack.push(newVariable(evalop.BreakpointHitCountVarNameQualified, fakeAddressUnresolv, godwarf.FakeSliceType(godwarf.FakeBasicType("uint", 64)), scope.BinInfo, scope.Mem))
+
+	case *evalop.PushRuntimeType:
+		typeAddr, _, _, err := dwarfToRuntimeType(scope.BinInfo, scope.Mem, op.Type)
+		if err != nil {
+			stack.err = err
+			break
+		}
+		rttyp, err := scope.BinInfo.findType(scope.BinInfo.runtimeTypeTypename())
+		if err != nil {
+			stack.err = err
+			break
+		}
+		v := newVariable("", typeAddr, rttyp, scope.BinInfo, scope.Mem)
+		stack.push(v.pointerToVariable())
+
+	case *evalop.PushNewFakeVariable:
+		stack.pushNewFakeVariable(scope, op.Type)
 
 	default:
 		stack.err = fmt.Errorf("internal debugger error: unknown eval opcode: %#v", op)
@@ -1124,8 +1289,111 @@ func (stack *evalStack) executeOp() {
 	stack.opidx++
 }
 
+func (stack *evalStack) pushLocal(scope *EvalScope, name string, frame int64) (found bool) {
+	var vars []*Variable
+	var err error
+	if frame != 0 {
+		frameScope, err2 := ConvertEvalScope(scope.target, -1, int(frame), 0)
+		if err2 != nil {
+			stack.err = err2
+			return
+		}
+		vars, err = frameScope.Locals(0, name)
+	} else {
+		vars, err = scope.Locals(0, name)
+	}
+	if err != nil {
+		stack.err = err
+		return
+	}
+	found = false
+	for i := range vars {
+		if vars[i].Name == name && vars[i].Flags&VariableShadowed == 0 {
+			stack.push(vars[i])
+			found = true
+			break
+		}
+	}
+	return found
+}
+
+func (stack *evalStack) pushIdent(scope *EvalScope, name string) (found bool) {
+	found = stack.pushLocal(scope, name, 0)
+	if found || stack.err != nil {
+		return found
+	}
+	v, err := scope.findGlobal(scope.Fn.PackageName(), name)
+	if err != nil && !isSymbolNotFound(err) {
+		stack.err = err
+		return false
+	}
+	if v != nil {
+		v.Name = name
+		stack.push(v)
+		return true
+	}
+
+	switch name {
+	case "true", "false":
+		stack.push(newConstant(constant.MakeBool(name == "true"), scope.BinInfo, scope.Mem))
+		return true
+	case "nil":
+		stack.push(nilVariable)
+		return true
+	}
+
+	regname := validRegisterName(name)
+	if regname == "" {
+		return false
+	}
+	regnum, ok := scope.BinInfo.Arch.RegisterNameToDwarf(regname)
+	if !ok {
+		return false
+	}
+
+	reg := scope.Regs.Reg(uint64(regnum))
+	if reg == nil {
+		return
+	}
+	reg.FillBytes()
+
+	var typ godwarf.Type
+	if len(reg.Bytes) <= 8 {
+		typ = godwarf.FakeBasicType("uint", 64)
+	} else {
+		var err error
+		typ, err = scope.BinInfo.findType("string")
+		if err != nil {
+			stack.err = err
+			return false
+		}
+	}
+
+	v = newVariable(regname, 0, typ, scope.BinInfo, scope.Mem)
+	if v.Kind == reflect.String {
+		v.Len = int64(len(reg.Bytes) * 2)
+		v.Base = fakeAddressUnresolv
+	}
+	v.Addr = fakeAddressUnresolv
+	v.Flags = VariableCPURegister
+	v.reg = reg
+	stack.push(v)
+	return true
+}
+
+func (stack *evalStack) pushNewFakeVariable(scope *EvalScope, typ godwarf.Type) {
+	cm, err := CreateCompositeMemory(scope.Mem, scope.BinInfo.Arch, *new(op.DwarfRegisters), []op.Piece{{Kind: op.ImmPiece, Bytes: make([]byte, typ.Size()), Size: int(typ.Size())}}, typ.Size())
+	if err != nil {
+		stack.err = err
+		return
+	}
+	v := newVariable("", cm.base, typ, scope.BinInfo, cm)
+	v.Flags = VariableFakeAddress
+	stack.push(v)
+}
+
 func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
-	ops, err := evalop.CompileAST(scopeToEvalLookup{scope}, t)
+	ops, err := evalop.CompileAST(scopeToEvalLookup{scope}, t, scope.evalopFlags())
 	if err != nil {
 		return nil, err
 	}
@@ -1134,16 +1402,15 @@ func (scope *EvalScope) evalAST(t ast.Expr) (*Variable, error) {
 	return stack.result(nil)
 }
 
-func exprToString(t ast.Expr) string {
-	var buf bytes.Buffer
-	printer.Fprint(&buf, token.NewFileSet(), t)
-	return buf.String()
-}
-
 func (scope *EvalScope) evalJump(op *evalop.Jump, stack *evalStack) {
-	x := stack.peek()
-	if op.Pop {
-		stack.pop()
+	var x *Variable
+
+	switch op.When {
+	case evalop.JumpIfTrue, evalop.JumpIfFalse, evalop.JumpIfAllocStringChecksFail:
+		x = stack.peek()
+		if op.Pop {
+			stack.pop()
+		}
 	}
 
 	var v bool
@@ -1152,11 +1419,30 @@ func (scope *EvalScope) evalJump(op *evalop.Jump, stack *evalStack) {
 		v = true
 	case evalop.JumpIfFalse:
 		v = false
+	case evalop.JumpIfAllocStringChecksFail:
+		stringChecksFailed := x.Kind != reflect.String || x.Addr != 0 || x.Flags&VariableConstant == 0 || x.Len <= 0
+		nilCallCtx := scope.callCtx == nil // do not complain here, setValue will if no other errors happen
+		if stringChecksFailed || nilCallCtx {
+			stack.opidx = op.Target - 1
+			return
+		}
+		return
+	case evalop.JumpAlways:
+		stack.opidx = op.Target - 1
+		return
+	case evalop.JumpIfPinningDone:
+		fncall := stack.fncallPeek()
+		if len(fncall.addrsToPin) == 0 {
+			stack.opidx = op.Target - 1
+		}
+		return
+	default:
+		panic("internal error, bad jump condition")
 	}
 
 	if x.Kind != reflect.Bool {
 		if op.Node != nil {
-			stack.err = fmt.Errorf("expression %q should be boolean not %s", exprToString(op.Node), x.Kind)
+			stack.err = fmt.Errorf("expression %q should be boolean not %s", astutil.ExprToString(op.Node), x.Kind)
 		} else {
 			stack.err = errors.New("internal debugger error: expected boolean")
 		}
@@ -1176,19 +1462,24 @@ func (scope *EvalScope) evalJump(op *evalop.Jump, stack *evalStack) {
 func (scope *EvalScope) evalTypeCast(op *evalop.TypeCast, stack *evalStack) {
 	argv := stack.pop()
 
-	typ := resolveTypedef(op.DwarfType)
+	typ := godwarf.ResolveTypedef(op.DwarfType)
 
-	converr := fmt.Errorf("can not convert %q to %s", exprToString(op.Node.Args[0]), typ.String())
+	converr := fmt.Errorf("can not convert %q to %s", astutil.ExprToString(op.Node.Args[0]), typ.String())
 
 	// compatible underlying types
 	if typeCastCompatibleTypes(argv.RealType, typ) {
-		if ptyp, isptr := typ.(*godwarf.PtrType); argv.Kind == reflect.Ptr && argv.loaded && len(argv.Children) > 0 && isptr {
+		ptyp, isptr := typ.(*godwarf.PtrType)
+		_, isvoid := argv.DwarfType.(*godwarf.VoidType)
+		if (argv.Kind == reflect.Ptr || isvoid) && argv.loaded && len(argv.Children) > 0 && isptr {
 			cv := argv.Children[0]
 			argv.Children[0] = *newVariable(cv.Name, cv.Addr, ptyp.Type, cv.bi, cv.mem)
 			argv.Children[0].OnlyAddr = true
 		}
 		argv.RealType = typ
 		argv.DwarfType = op.DwarfType
+		if isptr {
+			argv.Kind = reflect.Ptr // could be converting from unsafe.Pointer
+		}
 		stack.push(argv)
 		return
 	}
@@ -1469,7 +1760,7 @@ func typeCastCompatibleTypes(typ1, typ2 godwarf.Type) bool {
 				return true
 			}
 			// pointer types are compatible if their element types are compatible
-			return typeCastCompatibleTypes(resolveTypedef(ttyp1.Type), resolveTypedef(ttyp2.Type))
+			return typeCastCompatibleTypes(godwarf.ResolveTypedef(ttyp1.Type), godwarf.ResolveTypedef(ttyp2.Type))
 		}
 	case *godwarf.StringType:
 		if _, ok := typ2.(*godwarf.StringType); ok {
@@ -1545,7 +1836,7 @@ func capBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 	}
 
 	arg := args[0]
-	invalidArgErr := fmt.Errorf("invalid argument %s (type %s) for cap", exprToString(nodeargs[0]), arg.TypeString())
+	invalidArgErr := fmt.Errorf("invalid argument %s (type %s) for cap", astutil.ExprToString(nodeargs[0]), arg.TypeString())
 
 	switch arg.Kind {
 	case reflect.Ptr:
@@ -1555,18 +1846,18 @@ func capBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 		}
 		fallthrough
 	case reflect.Array:
-		return newConstant(constant.MakeInt64(arg.Len), arg.mem), nil
+		return newConstant(constant.MakeInt64(arg.Len), arg.bi, arg.mem), nil
 	case reflect.Slice:
-		return newConstant(constant.MakeInt64(arg.Cap), arg.mem), nil
+		return newConstant(constant.MakeInt64(arg.Cap), arg.bi, arg.mem), nil
 	case reflect.Chan:
 		arg.loadValue(loadFullValue)
 		if arg.Unreadable != nil {
 			return nil, arg.Unreadable
 		}
 		if arg.Base == 0 {
-			return newConstant(constant.MakeInt64(0), arg.mem), nil
+			return newConstant(constant.MakeInt64(0), arg.bi, arg.mem), nil
 		}
-		return newConstant(arg.Children[1].Value, arg.mem), nil
+		return newConstant(arg.Children[1].Value, arg.bi, arg.mem), nil
 	default:
 		return nil, invalidArgErr
 	}
@@ -1577,7 +1868,7 @@ func lenBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 		return nil, fmt.Errorf("wrong number of arguments to len: %d", len(args))
 	}
 	arg := args[0]
-	invalidArgErr := fmt.Errorf("invalid argument %s (type %s) for len", exprToString(nodeargs[0]), arg.TypeString())
+	invalidArgErr := fmt.Errorf("invalid argument %s (type %s) for len", astutil.ExprToString(nodeargs[0]), arg.TypeString())
 
 	switch arg.Kind {
 	case reflect.Ptr:
@@ -1590,25 +1881,25 @@ func lenBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 		if arg.Unreadable != nil {
 			return nil, arg.Unreadable
 		}
-		return newConstant(constant.MakeInt64(arg.Len), arg.mem), nil
+		return newConstant(constant.MakeInt64(arg.Len), arg.bi, arg.mem), nil
 	case reflect.Chan:
 		arg.loadValue(loadFullValue)
 		if arg.Unreadable != nil {
 			return nil, arg.Unreadable
 		}
 		if arg.Base == 0 {
-			return newConstant(constant.MakeInt64(0), arg.mem), nil
+			return newConstant(constant.MakeInt64(0), arg.bi, arg.mem), nil
 		}
-		return newConstant(arg.Children[0].Value, arg.mem), nil
+		return newConstant(arg.Children[0].Value, arg.bi, arg.mem), nil
 	case reflect.Map:
-		it := arg.mapIterator()
+		it := arg.mapIterator(0)
 		if arg.Unreadable != nil {
 			return nil, arg.Unreadable
 		}
 		if it == nil {
-			return newConstant(constant.MakeInt64(0), arg.mem), nil
+			return newConstant(constant.MakeInt64(0), arg.bi, arg.mem), nil
 		}
-		return newConstant(constant.MakeInt64(arg.Len), arg.mem), nil
+		return newConstant(constant.MakeInt64(arg.Len), arg.bi, arg.mem), nil
 	default:
 		return nil, invalidArgErr
 	}
@@ -1634,11 +1925,11 @@ func complexBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 	}
 
 	if realev.Value == nil || ((realev.Value.Kind() != constant.Int) && (realev.Value.Kind() != constant.Float)) {
-		return nil, fmt.Errorf("invalid argument 1 %s (type %s) to complex", exprToString(nodeargs[0]), realev.TypeString())
+		return nil, fmt.Errorf("invalid argument 1 %s (type %s) to complex", astutil.ExprToString(nodeargs[0]), realev.TypeString())
 	}
 
 	if imagev.Value == nil || ((imagev.Value.Kind() != constant.Int) && (imagev.Value.Kind() != constant.Float)) {
-		return nil, fmt.Errorf("invalid argument 2 %s (type %s) to complex", exprToString(nodeargs[1]), imagev.TypeString())
+		return nil, fmt.Errorf("invalid argument 2 %s (type %s) to complex", astutil.ExprToString(nodeargs[1]), imagev.TypeString())
 	}
 
 	sz := int64(0)
@@ -1676,10 +1967,10 @@ func imagBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 	}
 
 	if arg.Kind != reflect.Complex64 && arg.Kind != reflect.Complex128 {
-		return nil, fmt.Errorf("invalid argument %s (type %s) to imag", exprToString(nodeargs[0]), arg.TypeString())
+		return nil, fmt.Errorf("invalid argument %s (type %s) to imag", astutil.ExprToString(nodeargs[0]), arg.TypeString())
 	}
 
-	return newConstant(constant.Imag(arg.Value), arg.mem), nil
+	return newConstant(constant.Imag(arg.Value), arg.bi, arg.mem), nil
 }
 
 func realBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
@@ -1695,10 +1986,10 @@ func realBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
 	}
 
 	if arg.Value == nil || ((arg.Value.Kind() != constant.Int) && (arg.Value.Kind() != constant.Float) && (arg.Value.Kind() != constant.Complex)) {
-		return nil, fmt.Errorf("invalid argument %s (type %s) to real", exprToString(nodeargs[0]), arg.TypeString())
+		return nil, fmt.Errorf("invalid argument %s (type %s) to real", astutil.ExprToString(nodeargs[0]), arg.TypeString())
 	}
 
-	return newConstant(constant.Real(arg.Value), arg.mem), nil
+	return newConstant(constant.Real(arg.Value), arg.bi, arg.mem), nil
 }
 
 func minBuiltin(args []*Variable, nodeargs []ast.Expr) (*Variable, error) {
@@ -1720,7 +2011,7 @@ func minmaxBuiltin(name string, op token.Token, args []*Variable, nodeargs []ast
 		}
 
 		if args[i].Unreadable != nil {
-			return nil, fmt.Errorf("could not load %q: %v", exprToString(nodeargs[i]), args[i].Unreadable)
+			return nil, fmt.Errorf("could not load %q: %v", astutil.ExprToString(nodeargs[i]), args[i].Unreadable)
 		}
 		if args[i].FloatSpecial != 0 {
 			return nil, errOperationOnSpecialFloat
@@ -1787,7 +2078,7 @@ func (scope *EvalScope) evalStructSelector(op *evalop.Select, stack *evalStack) 
 func (scope *EvalScope) evalTypeAssert(op *evalop.TypeAssert, stack *evalStack) {
 	xv := stack.pop()
 	if xv.Kind != reflect.Interface {
-		stack.err = fmt.Errorf("expression %q not an interface", exprToString(op.Node.X))
+		stack.err = fmt.Errorf("expression %q not an interface", astutil.ExprToString(op.Node.X))
 		return
 	}
 	xv.loadInterface(0, false, loadFullValue)
@@ -1800,7 +2091,7 @@ func (scope *EvalScope) evalTypeAssert(op *evalop.TypeAssert, stack *evalStack) 
 		return
 	}
 	if xv.Children[0].Addr == 0 {
-		stack.err = fmt.Errorf("interface conversion: %s is nil, not %s", xv.DwarfType.String(), exprToString(op.Node.Type))
+		stack.err = fmt.Errorf("interface conversion: %s is nil, not %s", xv.DwarfType.String(), astutil.ExprToString(op.Node.Type))
 		return
 	}
 	typ := op.DwarfType
@@ -1825,11 +2116,38 @@ func (scope *EvalScope) evalIndex(op *evalop.Index, stack *evalStack) {
 		return
 	}
 
+	if xev.Name == evalop.BreakpointHitCountVarNameQualified {
+		if idxev.Kind == reflect.String {
+			s := constant.StringVal(idxev.Value)
+			thc, err := totalHitCountByName(scope.target.Breakpoints().Logical, s)
+			if err == nil {
+				stack.push(newConstant(constant.MakeUint64(thc), scope.BinInfo, scope.Mem))
+			}
+			stack.err = err
+			return
+		}
+		n, err := idxev.asInt()
+		if err != nil {
+			n2, err := idxev.asUint()
+			if err != nil {
+				stack.err = fmt.Errorf("can not index %s with %s", xev.Name, astutil.ExprToString(op.Node.Index))
+				return
+			}
+			n = int64(n2)
+		}
+		thc, err := totalHitCountByID(scope.target.Breakpoints().Logical, int(n))
+		if err == nil {
+			stack.push(newConstant(constant.MakeUint64(thc), scope.BinInfo, scope.Mem))
+		}
+		stack.err = err
+		return
+	}
+
 	if xev.Flags&VariableCPtr == 0 {
 		xev = xev.maybeDereference()
 	}
 
-	cantindex := fmt.Errorf("expression %q (%s) does not support indexing", exprToString(op.Node.X), xev.TypeString())
+	cantindex := fmt.Errorf("expression %q (%s) does not support indexing", astutil.ExprToString(op.Node.X), xev.TypeString())
 
 	switch xev.Kind {
 	case reflect.Ptr:
@@ -1849,7 +2167,7 @@ func (scope *EvalScope) evalIndex(op *evalop.Index, stack *evalStack) {
 
 	case reflect.Slice, reflect.Array, reflect.String:
 		if xev.Base == 0 {
-			stack.err = fmt.Errorf("can not index %q", exprToString(op.Node.X))
+			stack.err = fmt.Errorf("can not index %q", astutil.ExprToString(op.Node.X))
 			return
 		}
 		n, err := idxev.asInt()
@@ -1902,32 +2220,32 @@ func (scope *EvalScope) evalReslice(op *evalop.Reslice, stack *evalStack) {
 	switch xev.Kind {
 	case reflect.Slice, reflect.Array, reflect.String:
 		if xev.Base == 0 {
-			stack.err = fmt.Errorf("can not slice %q", exprToString(op.Node.X))
+			stack.err = fmt.Errorf("can not slice %q", astutil.ExprToString(op.Node.X))
 			return
 		}
-		stack.pushErr(xev.reslice(low, high))
+		stack.pushErr(xev.reslice(low, high, op.TrustLen))
 		return
 	case reflect.Map:
 		if op.Node.High != nil {
-			stack.err = fmt.Errorf("second slice argument must be empty for maps")
+			stack.err = errors.New("second slice argument must be empty for maps")
 			return
 		}
 		xev.mapSkip += int(low)
-		xev.mapIterator() // reads map length
+		xev.mapIterator(0) // reads map length
 		if int64(xev.mapSkip) >= xev.Len {
-			stack.err = fmt.Errorf("map index out of bounds")
+			stack.err = errors.New("map index out of bounds")
 			return
 		}
 		stack.push(xev)
 		return
 	case reflect.Ptr:
 		if xev.Flags&VariableCPtr != 0 {
-			stack.pushErr(xev.reslice(low, high))
+			stack.pushErr(xev.reslice(low, high, op.TrustLen))
 			return
 		}
 		fallthrough
 	default:
-		stack.err = fmt.Errorf("can not slice %q (type %s)", exprToString(op.Node.X), xev.TypeString())
+		stack.err = fmt.Errorf("can not slice %q (type %s)", astutil.ExprToString(op.Node.X), xev.TypeString())
 		return
 	}
 }
@@ -1937,12 +2255,12 @@ func (scope *EvalScope) evalPointerDeref(op *evalop.PointerDeref, stack *evalSta
 	xev := stack.pop()
 
 	if xev.Kind != reflect.Ptr {
-		stack.err = fmt.Errorf("expression %q (%s) can not be dereferenced", exprToString(op.Node.X), xev.TypeString())
+		stack.err = fmt.Errorf("expression %q (%s) can not be dereferenced", astutil.ExprToString(op.Node.X), xev.TypeString())
 		return
 	}
 
 	if xev == nilVariable {
-		stack.err = fmt.Errorf("nil can not be dereferenced")
+		stack.err = errors.New("nil can not be dereferenced")
 		return
 	}
 
@@ -1962,7 +2280,7 @@ func (scope *EvalScope) evalPointerDeref(op *evalop.PointerDeref, stack *evalSta
 	}
 	rv := &xev.Children[0]
 	if rv.Addr == 0 {
-		stack.err = fmt.Errorf("nil pointer dereference")
+		stack.err = errors.New("nil pointer dereference")
 		return
 	}
 	stack.push(rv)
@@ -1972,7 +2290,7 @@ func (scope *EvalScope) evalPointerDeref(op *evalop.PointerDeref, stack *evalSta
 func (scope *EvalScope) evalAddrOf(op *evalop.AddrOf, stack *evalStack) {
 	xev := stack.pop()
 	if xev.Addr == 0 || xev.DwarfType == nil {
-		stack.err = fmt.Errorf("can not take address of %q", exprToString(op.Node.X))
+		stack.err = fmt.Errorf("can not take address of %q", astutil.ExprToString(op.Node.X))
 		return
 	}
 
@@ -1982,8 +2300,7 @@ func (scope *EvalScope) evalAddrOf(op *evalop.AddrOf, stack *evalStack) {
 func (v *Variable) pointerToVariable() *Variable {
 	v.OnlyAddr = true
 
-	typename := "*" + v.DwarfType.Common().Name
-	rv := v.newVariable("", 0, &godwarf.PtrType{CommonType: godwarf.CommonType{ByteSize: int64(v.bi.Arch.PtrSize()), Name: typename}, Type: v.DwarfType}, v.mem)
+	rv := v.newVariable("", 0, godwarf.FakePointerType(v.DwarfType, int64(v.bi.Arch.PtrSize())), v.mem)
 	rv.Children = []Variable{*v}
 	rv.loaded = true
 
@@ -2040,7 +2357,7 @@ func (scope *EvalScope) evalUnary(op *evalop.Unary, stack *evalStack) {
 		return
 	}
 	if xv.Value == nil {
-		stack.err = fmt.Errorf("operator %s can not be applied to %q", op.Node.Op.String(), exprToString(op.Node.X))
+		stack.err = fmt.Errorf("operator %s can not be applied to %q", op.Node.Op.String(), astutil.ExprToString(op.Node.X))
 		return
 	}
 	rc, err := constantUnaryOp(op.Node.Op, xv.Value)
@@ -2054,7 +2371,7 @@ func (scope *EvalScope) evalUnary(op *evalop.Unary, stack *evalStack) {
 		stack.push(r)
 		return
 	}
-	stack.push(newConstant(rc, xv.mem))
+	stack.push(newConstant(rc, xv.bi, xv.mem))
 }
 
 func negotiateType(op token.Token, xv, yv *Variable) (godwarf.Type, error) {
@@ -2076,7 +2393,7 @@ func negotiateType(op token.Token, xv, yv *Variable) (godwarf.Type, error) {
 			// ok
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 			if constant.Sign(yv.Value) < 0 {
-				return nil, fmt.Errorf("shift count must not be negative")
+				return nil, errors.New("shift count must not be negative")
 			}
 		default:
 			return nil, fmt.Errorf("shift count type %s, must be unsigned integer", yv.Kind.String())
@@ -2154,12 +2471,27 @@ func (scope *EvalScope) evalBinary(binop *evalop.Binary, stack *evalStack) {
 	}
 
 	op := node.Op
-	if typ != nil && (op == token.QUO) {
-		_, isint := typ.(*godwarf.IntType)
-		_, isuint := typ.(*godwarf.UintType)
-		if isint || isuint {
-			// forces integer division if the result type is integer
-			op = token.QUO_ASSIGN
+	if op == token.QUO {
+		if typ != nil {
+			_, isint := typ.(*godwarf.IntType)
+			_, isuint := typ.(*godwarf.UintType)
+			if isint || isuint {
+				// forces integer division if the result type is integer
+				op = token.QUO_ASSIGN
+			}
+		} else {
+			if xv.Value != nil && yv.Value != nil && xv.Value.Kind() == constant.Int && yv.Value.Kind() == constant.Int {
+				// See issue #3793 and the specification at https://go.dev/ref/spec#Constant_expressions
+				// in particular:
+				//
+				// "If the untyped operands of a binary operation (other than a shift)
+				// are of different kinds, the result is of the operand's kind that
+				// appears later in this list: integer, rune, floating-point, complex"
+				//
+				// However the go/constant package says that to get an integer result
+				// from a division token.QUO_ASSIGN must be used.
+				op = token.QUO_ASSIGN
+			}
 		}
 	}
 
@@ -2170,7 +2502,7 @@ func (scope *EvalScope) evalBinary(binop *evalop.Binary, stack *evalStack) {
 			stack.err = err
 			return
 		}
-		stack.push(newConstant(constant.MakeBool(v), xv.mem))
+		stack.push(newConstant(constant.MakeBool(v), xv.bi, xv.mem))
 
 	default:
 		if xv.Kind == reflect.String {
@@ -2180,12 +2512,12 @@ func (scope *EvalScope) evalBinary(binop *evalop.Binary, stack *evalStack) {
 			yv.loadValue(loadFullValueLongerStrings)
 		}
 		if xv.Value == nil {
-			stack.err = fmt.Errorf("operator %s can not be applied to %q", node.Op.String(), exprToString(node.X))
+			stack.err = fmt.Errorf("operator %s can not be applied to %q", node.Op.String(), astutil.ExprToString(node.X))
 			return
 		}
 
 		if yv.Value == nil {
-			stack.err = fmt.Errorf("operator %s can not be applied to %q", node.Op.String(), exprToString(node.Y))
+			stack.err = fmt.Errorf("operator %s can not be applied to %q", node.Op.String(), astutil.ExprToString(node.Y))
 			return
 		}
 
@@ -2196,7 +2528,7 @@ func (scope *EvalScope) evalBinary(binop *evalop.Binary, stack *evalStack) {
 		}
 
 		if typ == nil {
-			stack.push(newConstant(rc, xv.mem))
+			stack.push(newConstant(rc, xv.bi, xv.mem))
 			return
 		}
 
@@ -2244,7 +2576,7 @@ func compareOp(op token.Token, xv *Variable, yv *Variable) (bool, error) {
 			yv.loadValue(loadFullValueLongerStrings)
 		}
 		if int64(len(constant.StringVal(xv.Value))) != xv.Len || int64(len(constant.StringVal(yv.Value))) != yv.Len {
-			return false, fmt.Errorf("string too long for comparison")
+			return false, errors.New("string too long for comparison")
 		}
 		return constantCompare(op, xv.Value, yv.Value)
 	}
@@ -2279,7 +2611,7 @@ func compareOp(op token.Token, xv *Variable, yv *Variable) (bool, error) {
 		eql = xv.Children[0].Addr == yv.Children[0].Addr
 	case reflect.Array:
 		if int64(len(xv.Children)) != xv.Len || int64(len(yv.Children)) != yv.Len {
-			return false, fmt.Errorf("array too long for comparison")
+			return false, errors.New("array too long for comparison")
 		}
 		eql, err = equalChildren(xv, yv, true)
 	case reflect.Struct:
@@ -2287,7 +2619,7 @@ func compareOp(op token.Token, xv *Variable, yv *Variable) (bool, error) {
 			return false, nil
 		}
 		if int64(len(xv.Children)) != xv.Len || int64(len(yv.Children)) != yv.Len {
-			return false, fmt.Errorf("structure too deep for comparison")
+			return false, errors.New("structure too deep for comparison")
 		}
 		eql, err = equalChildren(xv, yv, false)
 	case reflect.Slice, reflect.Map, reflect.Func, reflect.Chan:
@@ -2446,8 +2778,8 @@ func sameType(t1, t2 godwarf.Type) bool {
 	// consistent, however we also synthesize some types ourselves
 	// (specifically pointers and slices) and we always use a reference through
 	// a typedef.
-	t1 = resolveTypedef(t1)
-	t2 = resolveTypedef(t2)
+	t1 = godwarf.ResolveTypedef(t1)
+	t2 = godwarf.ResolveTypedef(t2)
 
 	if tt1, isptr1 := t1.(*godwarf.PtrType); isptr1 {
 		tt2, isptr2 := t2.(*godwarf.PtrType)
@@ -2474,13 +2806,13 @@ func (v *Variable) sliceAccess(idx int) (*Variable, error) {
 		wrong = idx < 0
 	}
 	if wrong {
-		return nil, fmt.Errorf("index out of bounds")
+		return nil, errors.New("index out of bounds")
 	}
 	if v.loaded {
 		if v.Kind == reflect.String {
 			s := constant.StringVal(v.Value)
 			if idx >= len(s) {
-				return nil, fmt.Errorf("index out of bounds")
+				return nil, errors.New("index out of bounds")
 			}
 			r := v.newVariable("", v.Base+uint64(int64(idx)*v.stride), v.fieldType, v.mem)
 			r.loaded = true
@@ -2488,7 +2820,7 @@ func (v *Variable) sliceAccess(idx int) (*Variable, error) {
 			return r, nil
 		} else {
 			if idx >= len(v.Children) {
-				return nil, fmt.Errorf("index out of bounds")
+				return nil, errors.New("index out of bounds")
 			}
 			return &v.Children[idx], nil
 		}
@@ -2501,7 +2833,7 @@ func (v *Variable) sliceAccess(idx int) (*Variable, error) {
 }
 
 func (v *Variable) mapAccess(idx *Variable) (*Variable, error) {
-	it := v.mapIterator()
+	it := v.mapIterator(0)
 	if it == nil {
 		return nil, fmt.Errorf("can not access unreadable map: %v", v.Unreadable)
 	}
@@ -2539,7 +2871,7 @@ func (v *Variable) mapAccess(idx *Variable) (*Variable, error) {
 		return nil, v.Unreadable
 	}
 	// go would return zero for the map value type here, we do not have the ability to create zeroes
-	return nil, fmt.Errorf("key not found")
+	return nil, errors.New("key not found")
 }
 
 // LoadResliced returns a new array, slice or map that starts at index start and contains
@@ -2551,7 +2883,7 @@ func (v *Variable) LoadResliced(start int, cfg LoadConfig) (newV *Variable, err 
 		if high > v.Len {
 			high = v.Len
 		}
-		newV, err = v.reslice(low, high)
+		newV, err = v.reslice(low, high, false)
 		if err != nil {
 			return nil, err
 		}
@@ -2561,17 +2893,21 @@ func (v *Variable) LoadResliced(start int, cfg LoadConfig) (newV *Variable, err 
 		newV.loaded = false
 		newV.mapSkip = start
 	default:
-		return nil, fmt.Errorf("variable to reslice is not an array, slice, or map")
+		return nil, errors.New("variable to reslice is not an array, slice, or map")
 	}
 	newV.loadValue(cfg)
 	return newV, nil
 }
 
-func (v *Variable) reslice(low int64, high int64) (*Variable, error) {
+func (v *Variable) reslice(low int64, high int64, trustLen bool) (*Variable, error) {
 	wrong := false
 	cptrNeedsFakeSlice := false
 	if v.Flags&VariableCPtr == 0 {
-		wrong = low < 0 || low > v.Len || high < 0 || high > v.Len
+		if v.Kind == reflect.Slice {
+			wrong = low < 0 || low > v.Cap || high < 0 || high > v.Cap
+		} else {
+			wrong = low < 0 || low > v.Len || high < 0 || high > v.Len
+		}
 	} else {
 		wrong = low < 0 || high < 0
 		if high == 0 {
@@ -2580,14 +2916,14 @@ func (v *Variable) reslice(low int64, high int64) (*Variable, error) {
 		cptrNeedsFakeSlice = v.Kind != reflect.String
 	}
 	if wrong {
-		return nil, fmt.Errorf("index out of bounds")
+		return nil, errors.New("index out of bounds")
 	}
 
 	base := v.Base + uint64(low*v.stride)
 	len := high - low
 
 	if high-low < 0 {
-		return nil, fmt.Errorf("index out of bounds")
+		return nil, errors.New("index out of bounds")
 	}
 
 	typ := v.DwarfType
@@ -2601,12 +2937,19 @@ func (v *Variable) reslice(low int64, high int64) (*Variable, error) {
 	}
 
 	r := v.newVariable("", 0, typ, mem)
-	r.Cap = len
+	if v.Flags&VariableCPtr == 0 {
+		r.Cap = v.Cap - low
+	} else {
+		r.Cap = len
+	}
 	r.Len = len
 	r.Base = base
 	r.stride = v.stride
 	r.fieldType = v.fieldType
 	r.Flags = v.Flags
+	if trustLen {
+		r.Flags |= variableTrustLen
+	}
 	r.reg = v.reg
 
 	return r, nil

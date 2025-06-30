@@ -7,6 +7,7 @@ package terminal
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"errors"
 	"fmt"
 	"go/parser"
@@ -19,6 +20,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -102,14 +104,6 @@ var (
 	ShortLoadConfig = api.LoadConfig{MaxStringLen: 64, MaxStructFields: 3}
 )
 
-// byFirstAlias will sort by the first
-// alias of a command.
-type byFirstAlias []command
-
-func (a byFirstAlias) Len() int           { return len(a) }
-func (a byFirstAlias) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byFirstAlias) Less(i, j int) bool { return a[i].aliases[0] < a[j].aliases[0] }
-
 // DebugCommands returns a Commands struct with default commands defined.
 func DebugCommands(client service.Client) *Commands {
 	c := &Commands{client: client}
@@ -122,9 +116,32 @@ func DebugCommands(client service.Client) *Commands {
 Type "help" followed by the name of a command for more information about it.`},
 		{aliases: []string{"break", "b"}, group: breakCmds, cmdFn: breakpoint, helpMsg: `Sets a breakpoint.
 
-	break [name] [locspec]
+	break [name] [locspec] [if <condition>]
 
-See Documentation/cli/locspec.md for the syntax of locspec. If locspec is omitted a breakpoint will be set on the current line.
+Locspec is a location specifier in the form of:
+
+  * *<address> Specifies the location of memory address address. address can be specified as a decimal, hexadecimal or octal number
+  * <filename>:<line> Specifies the line in filename. filename can be the partial path to a file or even just the base name as long as the expression remains unambiguous.
+  * <line> Specifies the line in the current file
+  * +<offset> Specifies the line offset lines after the current one
+  * -<offset> Specifies the line offset lines before the current one
+  * <function>[:<line>] Specifies the line inside function.
+      The full syntax for function is <package>.(*<receiver type>).<function name> however the only required element is the function name,
+      everything else can be omitted as long as the expression remains unambiguous. For setting a breakpoint on an init function (ex: main.init),
+      the <filename>:<line> syntax should be used to break in the correct init function at the correct location.
+  * /<regex>/ Specifies the location of all the functions matching regex
+
+If locspec is omitted a breakpoint will be set on the current line.
+
+If you would like to assign a name to the breakpoint you can do so with the form:
+
+	break mybpname main.go:4
+
+Finally, you can assign a condition to the newly created breakpoint by using the 'if' postfix form, like so:
+
+	break main.go:55 if i == 5
+
+Alternatively you can set a condition on a breakpoint after created by using the 'on' command.
 
 See also: "help on", "help cond" and "help clear"`},
 		{aliases: []string{"trace", "t"}, group: breakCmds, cmdFn: tracepoint, allowedPrefixes: onPrefix, helpMsg: `Set tracepoint.
@@ -186,7 +203,8 @@ For example:
 	continue encoding/json.Marshal
 `},
 		{aliases: []string{"step", "s"}, group: runCmds, cmdFn: c.step, allowedPrefixes: revPrefix, helpMsg: "Single step through program."},
-		{aliases: []string{"step-instruction", "si"}, group: runCmds, allowedPrefixes: revPrefix, cmdFn: c.stepInstruction, helpMsg: "Single step a single cpu instruction."},
+		{aliases: []string{"step-instruction", "si", "stepi"}, group: runCmds, allowedPrefixes: revPrefix, cmdFn: c.stepInstruction, helpMsg: "Single step a single cpu instruction."},
+		{aliases: []string{"next-instruction", "ni", "nexti"}, group: runCmds, allowedPrefixes: revPrefix, cmdFn: c.nextInstruction, helpMsg: "Single step a single cpu instruction, skipping function calls."},
 		{aliases: []string{"next", "n"}, group: runCmds, cmdFn: c.next, allowedPrefixes: revPrefix, helpMsg: `Step over to next source line.
 
 	next [count]
@@ -224,7 +242,7 @@ Current limitations:
 If called with the locspec argument it will delete all the breakpoints matching the locspec. If locspec is omitted all breakpoints are deleted.`},
 		{aliases: []string{"toggle"}, group: breakCmds, cmdFn: toggle, helpMsg: `Toggles on or off a breakpoint.
 
-toggle <breakpoint name or id>`},
+	toggle <breakpoint name or id>`},
 		{aliases: []string{"goroutines", "grs"}, group: goroutineCmds, cmdFn: c.goroutines, helpMsg: `List program goroutines.
 
 	goroutines [-u|-r|-g|-s] [-t [depth]] [-l] [-with loc expr] [-without loc expr] [-group argument] [-chan expr] [-exec command]
@@ -296,7 +314,7 @@ GROUPING
 	goloc: groups goroutines by the location of the go instruction that created the goroutine
 	startloc: groups goroutines by the location of the start function
 	running: groups goroutines by whether they are running or not
-	user: groups goroutines by weather they are user or runtime goroutines
+	user: groups goroutines by whether they are user or runtime goroutines
 
 
 Groups goroutines by the given location, running status or user classification, up to 5 goroutines per group will be displayed as well as the total number of goroutines in the group.
@@ -490,7 +508,7 @@ The command 'on x -edit' can be used to edit the list of commands executed when 
 
 Specifies that the breakpoint, tracepoint or watchpoint should break only if the boolean expression is true.
 
-See Documentation/cli/expr.md for a description of supported expressions.
+See Documentation/cli/expr.md for a description of supported expressions and Documentation/cli/cond.md for a description of how breakpoint conditions are evaluated.
 
 With the -hitcount option a condition on the breakpoint hit count can be set, the following operators are supported
 
@@ -531,10 +549,13 @@ Changes the value of a configuration parameter.
 	config substitute-path <from> <to>
 	config substitute-path <from>
 	config substitute-path -clear
+	config substitute-path -guess
 
 Adds or removes a path substitution rule, if -clear is used all
 substitute-path rules are removed. Without arguments shows the current list
 of substitute-path rules.
+The -guess option causes Delve to try to guess your substitute-path
+configuration automatically.
 See also Documentation/cli/substitutepath.md for how the rules are applied.
 
 	config alias <command> <alias>
@@ -562,7 +583,7 @@ Examine memory:
 	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] <address>
 	examinemem [-fmt <format>] [-count|-len <count>] [-size <size>] -x <expression>
 
-Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal).
+Format represents the data format and the value is one of this list (default hex): bin(binary), oct(octal), dec(decimal), hex(hexadecimal) and raw.
 Length is the number of bytes (default 1) and must be less than or equal to 1000.
 Address is the memory location of the target to examine. Please note '-len' is deprecated by '-count and -size'.
 Expression can be an integer expression or pointer value of the memory location to examine.
@@ -661,7 +682,9 @@ Currently, rev next, step, step-instruction and stepout commands are supported.`
 			})
 	}
 
-	sort.Sort(byFirstAlias(c.cmds))
+	slices.SortFunc(c.cmds, func(a, b command) int {
+		return strings.Compare(a.aliases[0], b.aliases[0])
+	})
 	return c
 }
 
@@ -787,12 +810,6 @@ func (c *Commands) help(t *Term, ctx callContext, args string) error {
 	return nil
 }
 
-type byThreadID []*api.Thread
-
-func (a byThreadID) Len() int           { return len(a) }
-func (a byThreadID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byThreadID) Less(i, j int) bool { return a[i].ID < a[j].ID }
-
 func threads(t *Term, ctx callContext, args string) error {
 	threads, err := t.client.ListThreads()
 	if err != nil {
@@ -802,7 +819,7 @@ func threads(t *Term, ctx callContext, args string) error {
 	if err != nil {
 		return err
 	}
-	sort.Sort(byThreadID(threads))
+	slices.SortFunc(threads, func(a, b *api.Thread) int { return cmp.Compare(a.ID, b.ID) })
 	done := false
 	t.stdout.pw.PageMaybe(func() { done = false })
 	for _, th := range threads {
@@ -826,7 +843,7 @@ func threads(t *Term, ctx callContext, args string) error {
 
 func thread(t *Term, ctx callContext, args string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("you must specify a thread")
+		return errors.New("you must specify a thread")
 	}
 	tid, err := strconv.Atoi(args)
 	if err != nil {
@@ -852,12 +869,6 @@ func thread(t *Term, ctx callContext, args string) error {
 	fmt.Fprintf(t.stdout, "Switched from %s to %s\n", oldThread, newThread)
 	return nil
 }
-
-type byGoroutineID []*api.Goroutine
-
-func (a byGoroutineID) Len() int           { return len(a) }
-func (a byGoroutineID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byGoroutineID) Less(i, j int) bool { return a[i].ID < a[j].ID }
 
 func (c *Commands) printGoroutines(t *Term, ctx callContext, indent string, gs []*api.Goroutine, fgl api.FormatGoroutineLoc, flags api.PrintGoroutinesFlags, depth int, cmd string, pdone *bool, state *api.DebuggerState) error {
 	for _, g := range gs {
@@ -934,7 +945,7 @@ func (c *Commands) goroutines(t *Term, ctx callContext, argstr string) error {
 				fmt.Fprintf(t.stdout, "Too many groups\n")
 			}
 		} else {
-			sort.Sort(byGoroutineID(gs))
+			slices.SortFunc(gs, func(a, b *api.Goroutine) int { return cmp.Compare(a.ID, b.ID) })
 			err = c.printGoroutines(t, ctx, "", gs, fgl, flags, depth, cmd, &done, state)
 			if err != nil {
 				return err
@@ -1164,6 +1175,13 @@ var waitReasonStrings = [...]string{
 	"GC worker (idle)",
 	"preempted",
 	"debug call",
+	"GC mark termination",
+	"stopping the world",
+	"flushing proc caches",
+	"trace goroutine status",
+	"trace proc status",
+	"page trace flush",
+	"coroutine",
 }
 
 func writeGoroutineLong(t *Term, w io.Writer, g *api.Goroutine, prefix string) {
@@ -1234,7 +1252,7 @@ func restartRecorded(t *Term, ctx callContext, args string) error {
 			}
 		} else {
 			if len(v) > 1 {
-				return fmt.Errorf("too many arguments to restart")
+				return errors.New("too many arguments to restart")
 			}
 			restartPos = v[0]
 		}
@@ -1310,7 +1328,7 @@ func parseNewArgv(args string) (resetArgs bool, newArgv []string, newRedirects [
 	}
 	if w[0] == "-noargs" {
 		if len(w) > 1 {
-			return false, nil, [3]string{}, fmt.Errorf("too many arguments to restart")
+			return false, nil, [3]string{}, errors.New("too many arguments to restart")
 		}
 		return true, nil, [3]string{}, nil
 	}
@@ -1504,24 +1522,34 @@ func (c *Commands) step(t *Term, ctx callContext, args string) error {
 
 var errNotOnFrameZero = errors.New("not on topmost frame")
 
+// stepInstruction implements the step-instruction (stepi) command.
 func (c *Commands) stepInstruction(t *Term, ctx callContext, args string) error {
+	return stepInstruction(t, ctx, c.frame, false)
+}
+
+// nextInstruction implements the next-instruction (nexti) command.
+func (c *Commands) nextInstruction(t *Term, ctx callContext, args string) error {
+	return stepInstruction(t, ctx, c.frame, true)
+}
+
+func stepInstruction(t *Term, ctx callContext, frame int, skipCalls bool) error {
 	if err := scopePrefixSwitch(t, ctx); err != nil {
 		return err
 	}
-	if c.frame != 0 {
+	if frame != 0 {
 		return errNotOnFrameZero
 	}
 
 	defer t.onStop()
 
-	var fn func() (*api.DebuggerState, error)
+	var fn func(bool) (*api.DebuggerState, error)
 	if ctx.Prefix == revPrefix {
 		fn = t.client.ReverseStepInstruction
 	} else {
 		fn = t.client.StepInstruction
 	}
 
-	state, err := exitedToError(fn())
+	state, err := exitedToError(fn(skipCalls))
 	if err != nil {
 		printcontextNoState(t)
 		return err
@@ -1622,7 +1650,7 @@ func (c *Commands) call(t *Term, ctx callContext, args string) error {
 
 func clear(t *Term, ctx callContext, args string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("not enough arguments")
+		return errors.New("not enough arguments")
 	}
 	id, err := strconv.Atoi(args)
 	var bp *api.Breakpoint
@@ -1681,7 +1709,7 @@ func clearAll(t *Term, ctx callContext, args string) error {
 
 func toggle(t *Term, ctx callContext, args string) error {
 	if args == "" {
-		return fmt.Errorf("not enough arguments")
+		return errors.New("not enough arguments")
 	}
 	id, err := strconv.Atoi(args)
 	var bp *api.Breakpoint
@@ -1697,19 +1725,12 @@ func toggle(t *Term, ctx callContext, args string) error {
 	return nil
 }
 
-// byID sorts breakpoints by ID.
-type byID []*api.Breakpoint
-
-func (a byID) Len() int           { return len(a) }
-func (a byID) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a byID) Less(i, j int) bool { return a[i].ID < a[j].ID }
-
 func breakpoints(t *Term, ctx callContext, args string) error {
 	breakPoints, err := t.client.ListBreakpoints(args == "-a")
 	if err != nil {
 		return err
 	}
-	sort.Sort(byID(breakPoints))
+	slices.SortFunc(breakPoints, func(a, b *api.Breakpoint) int { return cmp.Compare(a.ID, b.ID) })
 	for _, bp := range breakPoints {
 		enabled := "(enabled)"
 		if bp.Disabled {
@@ -1778,31 +1799,54 @@ func formatBreakpointAttrs(prefix string, bp *api.Breakpoint, includeTrace bool)
 }
 
 func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]*api.Breakpoint, error) {
-	args := config.Split2PartsBySpace(argstr)
+	var (
+		spec string
 
-	requestedBp := &api.Breakpoint{}
-	spec := ""
-	switch len(args) {
-	case 1:
-		if len(args[0]) != 0 {
-			spec = argstr
-		} else {
-			// no arg specified
-			spec = "+0"
+		requestedBp = &api.Breakpoint{}
+	)
+
+	parseSpec := func(args []string) error {
+		switch len(args) {
+		case 1:
+			if len(args[0]) != 0 {
+				spec = argstr
+			} else {
+				// no arg specified
+				spec = "+0"
+			}
+		case 2:
+			if api.ValidBreakpointName(args[0]) == nil {
+				requestedBp.Name = args[0]
+				spec = args[1]
+			} else {
+				spec = argstr
+			}
+		default:
+			return errors.New("address required")
 		}
-	case 2:
-		if api.ValidBreakpointName(args[0]) == nil {
-			requestedBp.Name = args[0]
-			spec = args[1]
-		} else {
-			spec = argstr
-		}
-	default:
-		return nil, fmt.Errorf("address required")
+		return nil
+	}
+
+	args := config.Split2PartsBySpace(argstr)
+	if err := parseSpec(args); err != nil {
+		return nil, err
 	}
 
 	requestedBp.Tracepoint = tracepoint
 	locs, substSpec, findLocErr := t.client.FindLocation(ctx.Scope, spec, true, t.substitutePathRules())
+	if findLocErr != nil {
+		r := regexp.MustCompile(`^if | if `)
+		if match := r.FindStringIndex(argstr); match != nil {
+			requestedBp.Name = ""
+			requestedBp.Cond = argstr[match[1]:]
+			argstr = argstr[:match[0]]
+			args = config.Split2PartsBySpace(argstr)
+			if err := parseSpec(args); err != nil {
+				return nil, err
+			}
+			locs, substSpec, findLocErr = t.client.FindLocation(ctx.Scope, spec, true, t.substitutePathRules())
+		}
+	}
 	if findLocErr != nil && requestedBp.Name != "" {
 		requestedBp.Name = ""
 		spec = argstr
@@ -1814,13 +1858,22 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 			substSpec = substSpec2
 		}
 	}
-	if findLocErr != nil && shouldAskToSuspendBreakpoint(t) {
+
+	fns, _ := t.client.ListFunctions(`^plugin\.Open$`, 0)
+	_, err := t.client.GetState()
+	shouldAskToSuspendBreakpointQuestion := ""
+	switch {
+	case len(fns) > 0:
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?"
+	case isErrProcessExited(err):
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when process restarts) [Y/n]?"
+	case t.client.FollowExecEnabled():
+		shouldAskToSuspendBreakpointQuestion = "Set a suspended breakpoint (Delve will try to set this breakpoint when child processes are added) [Y/n]?"
+	}
+
+	if findLocErr != nil && shouldAskToSuspendBreakpointQuestion != "" {
 		fmt.Fprintf(os.Stderr, "Command failed: %s\n", findLocErr.Error())
-		question := "Set a suspended breakpoint (Delve will try to set this breakpoint when a plugin is loaded) [Y/n]?"
-		if isErrProcessExited(findLocErr) {
-			question = "Set a suspended breakpoint (Delve will try to set this breakpoint when the process is restarted) [Y/n]?"
-		}
-		answer, err := yesno(t.line, question, "yes")
+		answer, err := yesno(t.line, shouldAskToSuspendBreakpointQuestion, "yes")
 		if err != nil {
 			return nil, err
 		}
@@ -1835,6 +1888,7 @@ func setBreakpoint(t *Term, ctx callContext, tracepoint bool, argstr string) ([]
 		fmt.Fprintf(t.stdout, "%s set at %s\n", formatBreakpointName(bp, true), t.formatBreakpointLocation(bp))
 		return nil, nil
 	}
+
 	if findLocErr != nil {
 		return nil, findLocErr
 	}
@@ -1913,22 +1967,32 @@ func tracepoint(t *Term, ctx callContext, args string) error {
 	return err
 }
 
-func getEditorName() (string, error) {
+func getEditorName() (string, []string, error) {
 	var editor string
 	if editor = os.Getenv("DELVE_EDITOR"); editor == "" {
 		if editor = os.Getenv("EDITOR"); editor == "" {
-			return "", fmt.Errorf("Neither DELVE_EDITOR or EDITOR is set")
+			return "", nil, errors.New("Neither DELVE_EDITOR or EDITOR is set")
 		}
 	}
-	return editor, nil
+
+	editorParts := strings.Fields(editor)
+	editor = editorParts[0]
+
+	var userArgs []string
+	if len(editorParts) > 1 {
+		userArgs = editorParts[1:]
+	}
+
+	return editor, userArgs, nil
 }
 
 func runEditor(args ...string) error {
-	editor, err := getEditorName()
+	editor, userArgs, err := getEditorName()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(editor, args...)
+	allArgs := append(userArgs, args...)
+	cmd := exec.Command(editor, allArgs...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1940,13 +2004,15 @@ func edit(t *Term, ctx callContext, args string) error {
 	if err != nil {
 		return err
 	}
-	editor, err := getEditorName()
+	editor, _, err := getEditorName()
 	if err != nil {
 		return err
 	}
 	switch editor {
 	case "code":
 		return runEditor("--goto", fmt.Sprintf("%s:%d", file, lineno))
+	case "zed":
+		return runEditor(fmt.Sprintf("%s:%d:0", file, lineno))
 	case "hx":
 		return runEditor(fmt.Sprintf("%s:%d", file, lineno))
 	case "vi", "vim", "nvim":
@@ -1990,9 +2056,10 @@ func examineMemoryCmd(t *Term, ctx callContext, argstr string) error {
 
 	// Default value
 	priFmt := byte('x')
-	count := 1
-	size := 1
+	count := int64(1)
+	size := int64(1)
 	isExpr := false
+	rawout := false
 
 	// nextArg returns the next argument that is not an empty string, if any, and
 	// advances the args slice to the position after that.
@@ -2016,41 +2083,45 @@ loop:
 		case "-fmt":
 			arg := nextArg()
 			if arg == "" {
-				return fmt.Errorf("expected argument after -fmt")
+				return errors.New("expected argument after -fmt")
 			}
-			fmtMapToPriFmt := map[string]byte{
-				"oct":         'o',
-				"octal":       'o',
-				"hex":         'x',
-				"hexadecimal": 'x',
-				"dec":         'd',
-				"decimal":     'd',
-				"bin":         'b',
-				"binary":      'b',
-			}
-			priFmt, ok = fmtMapToPriFmt[arg]
-			if !ok {
-				return fmt.Errorf("%q is not a valid format", arg)
+			if arg == "raw" {
+				rawout = true
+			} else {
+				fmtMapToPriFmt := map[string]byte{
+					"oct":         'o',
+					"octal":       'o',
+					"hex":         'x',
+					"hexadecimal": 'x',
+					"dec":         'd',
+					"decimal":     'd',
+					"bin":         'b',
+					"binary":      'b',
+				}
+				priFmt, ok = fmtMapToPriFmt[arg]
+				if !ok {
+					return fmt.Errorf("%q is not a valid format", arg)
+				}
 			}
 		case "-count", "-len":
 			arg := nextArg()
 			if arg == "" {
-				return fmt.Errorf("expected argument after -count/-len")
+				return errors.New("expected argument after -count/-len")
 			}
 			var err error
-			count, err = strconv.Atoi(arg)
+			count, err = strconv.ParseInt(arg, 0, 64)
 			if err != nil || count <= 0 {
-				return fmt.Errorf("count/len must be a positive integer")
+				return errors.New("count/len must be a positive integer")
 			}
 		case "-size":
 			arg := nextArg()
 			if arg == "" {
-				return fmt.Errorf("expected argument after -size")
+				return errors.New("expected argument after -size")
 			}
 			var err error
-			size, err = strconv.Atoi(arg)
+			size, err = strconv.ParseInt(arg, 0, 64)
 			if err != nil || size <= 0 || size > 8 {
-				return fmt.Errorf("size must be a positive integer (<=8)")
+				return errors.New("size must be a positive integer (<=8)")
 			}
 		case "-x":
 			isExpr = true
@@ -2064,13 +2135,8 @@ loop:
 		}
 	}
 
-	// TODO, maybe configured by user.
-	if count*size > 1000 {
-		return fmt.Errorf("read memory range (count*size) must be less than or equal to 1000 bytes")
-	}
-
 	if len(args) == 0 {
-		return fmt.Errorf("no address specified")
+		return errors.New("no address specified")
 	}
 
 	if isExpr {
@@ -2102,12 +2168,28 @@ loop:
 		}
 	}
 
-	memArea, isLittleEndian, err := t.client.ExamineMemory(address, count*size)
-	if err != nil {
-		return err
-	}
 	t.stdout.pw.PageMaybe(nil)
-	fmt.Fprint(t.stdout, api.PrettyExamineMemory(uintptr(address), memArea, isLittleEndian, priFmt, size))
+
+	start := address
+	remsz := int(count * size)
+
+	for remsz > 0 {
+		reqsz := rpc2.ExamineMemoryLengthLimit
+		if reqsz > remsz {
+			reqsz = remsz
+		}
+		memArea, isLittleEndian, err := t.client.ExamineMemory(start, reqsz)
+		if err != nil {
+			return err
+		}
+		if rawout {
+			t.stdout.Write(memArea)
+		} else {
+			fmt.Fprint(t.stdout, api.PrettyExamineMemory(uintptr(start), memArea, isLittleEndian, priFmt, int(size)))
+		}
+		start += uint64(reqsz)
+		remsz -= reqsz
+	}
 	return nil
 }
 
@@ -2126,7 +2208,7 @@ const maxPrintVarChanGoroutines = 100
 
 func (c *Commands) printVar(t *Term, ctx callContext, args string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("not enough arguments")
+		return errors.New("not enough arguments")
 	}
 	if ctx.Prefix == onPrefix {
 		ctx.Breakpoint.Variables = append(ctx.Breakpoint.Variables, args)
@@ -2137,6 +2219,8 @@ func (c *Commands) printVar(t *Term, ctx callContext, args string) error {
 	if err != nil {
 		return err
 	}
+
+	t.stdout.pw.PageMaybe(nil)
 
 	fmt.Fprintln(t.stdout, val.MultilineString("", fmtstr))
 
@@ -2160,7 +2244,7 @@ func (c *Commands) printVar(t *Term, ctx callContext, args string) error {
 
 func whatisCommand(t *Term, ctx callContext, args string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("not enough arguments")
+		return errors.New("not enough arguments")
 	}
 	val, err := t.client.EvalVariable(ctx.Scope, args, ShortLoadConfig)
 	if err != nil {
@@ -2189,7 +2273,7 @@ func setVar(t *Term, ctx callContext, args string) error {
 	// HACK: in go '=' is not an operator, we detect the error and try to recover from it by splitting the input string
 	_, err := parser.ParseExpr(args)
 	if err == nil {
-		return fmt.Errorf("syntax error '=' not found")
+		return errors.New("syntax error '=' not found")
 	}
 
 	el, ok := err.(scanner.ErrorList)
@@ -2208,6 +2292,7 @@ func (t *Term) printFilteredVariables(varType string, vars []api.Variable, filte
 		return err
 	}
 	match := false
+	t.stdout.pw.PageMaybe(nil)
 	for _, v := range vars {
 		if reg == nil || reg.Match([]byte(v.Name)) {
 			match = true
@@ -2261,7 +2346,7 @@ func packages(t *Term, ctx callContext, args string) error {
 }
 
 func funcs(t *Term, ctx callContext, args string) error {
-	return t.printSortedStrings(t.client.ListFunctions(args))
+	return t.printSortedStrings(t.client.ListFunctions(args, 0))
 }
 
 func types(t *Term, ctx callContext, args string) error {
@@ -2283,7 +2368,7 @@ func args(t *Term, ctx callContext, args string) error {
 	filter, cfg := parseVarArguments(args, t)
 	if ctx.Prefix == onPrefix {
 		if filter != "" {
-			return fmt.Errorf("filter not supported on breakpoint")
+			return errors.New("filter not supported on breakpoint")
 		}
 		ctx.Breakpoint.LoadArgs = &cfg
 		return nil
@@ -2299,7 +2384,7 @@ func locals(t *Term, ctx callContext, args string) error {
 	filter, cfg := parseVarArguments(args, t)
 	if ctx.Prefix == onPrefix {
 		if filter != "" {
-			return fmt.Errorf("filter not supported on breakpoint")
+			return errors.New("filter not supported on breakpoint")
 		}
 		ctx.Breakpoint.LoadLocals = &cfg
 		return nil
@@ -2402,7 +2487,6 @@ func parseStackArgs(argstr string) (stackArgs, error) {
 					return 0, fmt.Errorf("expected number after %s: %v", name, err)
 				}
 				return n, nil
-
 			}
 			switch args[i] {
 			case "-full":
@@ -2414,7 +2498,7 @@ func parseStackArgs(argstr string) (stackArgs, error) {
 			case "-mode":
 				i++
 				if i >= len(args) {
-					return stackArgs{}, fmt.Errorf("expected normal, simple or fromg after -mode")
+					return stackArgs{}, errors.New("expected normal, simple or fromg after -mode")
 				}
 				switch args[i] {
 				case "normal":
@@ -2425,7 +2509,7 @@ func parseStackArgs(argstr string) (stackArgs, error) {
 				case "fromg":
 					r.opts |= api.StacktraceG | api.StacktraceSimple
 				default:
-					return stackArgs{}, fmt.Errorf("expected normal, simple or fromg after -mode")
+					return stackArgs{}, errors.New("expected normal, simple or fromg after -mode")
 				}
 			case "-a":
 				i++
@@ -2444,7 +2528,7 @@ func parseStackArgs(argstr string) (stackArgs, error) {
 			default:
 				n, err := strconv.Atoi(args[i])
 				if err != nil {
-					return stackArgs{}, fmt.Errorf("depth must be a number")
+					return stackArgs{}, errors.New("depth must be a number")
 				}
 				r.depth = n
 			}
@@ -2523,7 +2607,7 @@ func listCommand(t *Term, ctx callContext, args string) error {
 
 func (c *Commands) sourceCommand(t *Term, ctx callContext, args string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("wrong number of arguments: source <filename>")
+		return errors.New("wrong number of arguments: source <filename>")
 	}
 
 	if args == "-" {
@@ -2622,7 +2706,7 @@ func libraries(t *Term, ctx callContext, args string) error {
 	for i := range libs {
 		fmt.Fprintf(t.stdout, "%"+strconv.Itoa(d)+"d. %#x %s\n", i, libs[i].Address, libs[i].Path)
 		if libs[i].LoadError != "" {
-			fmt.Fprintf(t.stdout, "    Load error: %s", libs[i].LoadError)
+			fmt.Fprintf(t.stdout, "    Load error: %s\n", libs[i].LoadError)
 		}
 	}
 	return nil
@@ -2636,7 +2720,7 @@ func digits(n int) int {
 }
 
 func printStack(t *Term, out io.Writer, stack []api.Stackframe, ind string, offsets bool) {
-	api.PrintStack(t.formatPath, out, stack, ind, offsets, func(api.Stackframe) bool { return true })
+	api.PrintStack(t.formatPath, out, stack, ind, offsets, t.stackTraceColors, func(api.Stackframe) bool { return true })
 }
 
 func printcontext(t *Term, state *api.DebuggerState) {
@@ -2756,6 +2840,8 @@ func printcontextThread(t *Term, th *api.Thread) {
 		bpname = fmt.Sprintf("watchpoint on [%s] ", th.Breakpoint.WatchExpr)
 	} else if th.Breakpoint.Name != "" {
 		bpname = fmt.Sprintf("[%s] ", th.Breakpoint.Name)
+	} else if !th.Breakpoint.Tracepoint {
+		bpname = fmt.Sprintf("[Breakpoint %d] ", th.Breakpoint.ID)
 	}
 
 	if th.Breakpoint.Tracepoint || th.Breakpoint.TraceReturn {
@@ -2837,11 +2923,13 @@ func printBreakpointInfo(t *Term, th *api.Thread, tracepointOnNewline bool) {
 			fmt.Fprintf(t.stdout, "\t%s: %s\n", v.Name, v.MultilineString("\t", ""))
 		}
 	}
-
 	if bpi.Stacktrace != nil {
-		tracepointnl()
-		fmt.Fprintf(t.stdout, "\tStack:\n")
-		printStack(t, t.stdout, bpi.Stacktrace, "\t\t", false)
+		// TraceFollowCalls and Stacktrace are mutually exclusive as they pollute each others outputs
+		if th.Breakpoint.TraceFollowCalls <= 0 {
+			tracepointnl()
+			fmt.Fprintf(t.stdout, "\tStack:\n")
+			printStack(t, t.stdout, bpi.Stacktrace, "\t\t", false)
+		}
 	}
 }
 
@@ -2850,8 +2938,39 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, a
 		fmt.Fprintf(t.stdout, "%s ", time.Now().Format(time.RFC3339Nano))
 	}
 
+	var sdepth, rootindex int
+	depthPrefix := ""
+	tracePrefix := ""
+	if th.Breakpoint.TraceFollowCalls > 0 {
+		// Trace Follow Calls; stack is required to calculate depth of functions
+		rootindex = -1
+		if th.BreakpointInfo == nil || th.BreakpointInfo.Stacktrace == nil {
+			return
+		}
+
+		stack := th.BreakpointInfo.Stacktrace
+		for i := len(stack) - 1; i >= 0; i-- {
+			if stack[i].Function.Name() == th.Breakpoint.RootFuncName {
+				if rootindex == -1 {
+					rootindex = i
+					break
+				}
+			}
+		}
+		sdepth = rootindex + 1
+		tracePrefix = fmt.Sprintf("goroutine(%d):frame(%d)", th.GoroutineID, sdepth)
+		if sdepth > 0 {
+			depthPrefix = strings.Repeat(" ", sdepth-1)
+		}
+	} else {
+		tracePrefix = fmt.Sprintf("goroutine(%d):", th.GoroutineID)
+	}
+
 	if th.Breakpoint.Tracepoint {
-		fmt.Fprintf(t.stdout, "> goroutine(%d): %s%s(%s)\n", th.GoroutineID, bpname, fn.Name(), args)
+		// Print trace only if there was a match on the function while TraceFollowCalls is on or if it's a regular trace
+		if rootindex != -1 || th.Breakpoint.TraceFollowCalls <= 0 {
+			fmt.Fprintf(t.stdout, "%s> %s %s%s(%s)\n", depthPrefix, tracePrefix, bpname, fn.Name(), args)
+		}
 		printBreakpointInfo(t, th, !hasReturnValue)
 	}
 	if th.Breakpoint.TraceReturn {
@@ -2859,7 +2978,14 @@ func printTracepoint(t *Term, th *api.Thread, bpname string, fn *api.Function, a
 		for _, v := range th.ReturnValues {
 			retVals = append(retVals, v.SinglelineString())
 		}
-		fmt.Fprintf(t.stdout, ">> goroutine(%d): => (%s)\n", th.GoroutineID, strings.Join(retVals, ","))
+		// Print trace only if there was a match on the function while TraceFollowCalls is on or if it's a regular trace
+		if rootindex != -1 || th.Breakpoint.TraceFollowCalls <= 0 {
+			fmt.Fprintf(t.stdout, "%s>> %s %s => (%s)\n", depthPrefix, tracePrefix, fn.Name(), strings.Join(retVals, ","))
+		}
+	}
+	if th.Breakpoint.TraceFollowCalls > 0 {
+		// As of now traceFollowCalls and Stacktrace are mutually exclusive options
+		return
 	}
 	if th.Breakpoint.TraceReturn || !hasReturnValue {
 		if th.BreakpointInfo != nil && th.BreakpointInfo.Stacktrace != nil {
@@ -3012,10 +3138,11 @@ func (c *Commands) onCmd(t *Term, ctx callContext, argstr string) error {
 			return err
 		}
 		defer func() {
+			_ = f.Close()
 			_ = os.Remove(f.Name())
 		}()
 		attrs := formatBreakpointAttrs("", ctx.Breakpoint, true)
-		_, err = f.Write([]byte(strings.Join(attrs, "\n")))
+		_, err = f.WriteString(strings.Join(attrs, "\n"))
 		if err != nil {
 			return err
 		}
@@ -3072,7 +3199,7 @@ func conditionCmd(t *Term, ctx callContext, argstr string) error {
 	args := config.Split2PartsBySpace(argstr)
 
 	if len(args) < 2 {
-		return fmt.Errorf("not enough arguments")
+		return errors.New("not enough arguments")
 	}
 
 	hitCondPerG := args[0] == "-per-g-hitcount"
@@ -3087,7 +3214,7 @@ func conditionCmd(t *Term, ctx callContext, argstr string) error {
 
 		args = config.Split2PartsBySpace(args[1])
 		if len(args) < 2 {
-			return fmt.Errorf("not enough arguments")
+			return errors.New("not enough arguments")
 		}
 
 		bp, err := getBreakpointByIDOrName(t, args[0])
@@ -3230,7 +3357,7 @@ func display(t *Term, ctx callContext, args string) error {
 		args = strings.TrimSpace(args[len(addOption):])
 		fmtstr, args := parseFormatArg(args)
 		if args == "" {
-			return fmt.Errorf("not enough arguments")
+			return errors.New("not enough arguments")
 		}
 		t.addDisplay(args, fmtstr)
 		t.printDisplay(len(t.displays) - 1)
@@ -3244,14 +3371,14 @@ func display(t *Term, ctx callContext, args string) error {
 		return t.removeDisplay(n)
 
 	default:
-		return fmt.Errorf("wrong arguments")
+		return errors.New("wrong arguments")
 	}
 	return nil
 }
 
 func dump(t *Term, ctx callContext, args string) error {
 	if args == "" {
-		return fmt.Errorf("not enough arguments")
+		return errors.New("not enough arguments")
 	}
 	dumpState, err := t.client.CoreDumpStart(args)
 	if err != nil {
@@ -3411,7 +3538,7 @@ func formatBreakpointName(bp *api.Breakpoint, upcase bool) string {
 		thing = "watchpoint"
 	}
 	if upcase {
-		thing = strings.Title(thing)
+		thing = strings.ToUpper(string(thing[0])) + thing[1:]
 	}
 	id := bp.Name
 	if id == "" {
@@ -3446,10 +3573,4 @@ func (t *Term) formatBreakpointLocation(bp *api.Breakpoint) string {
 		fmt.Fprintf(&out, "%s:%d", p, bp.Line)
 	}
 	return out.String()
-}
-
-func shouldAskToSuspendBreakpoint(t *Term) bool {
-	fns, _ := t.client.ListFunctions(`^plugin\.Open$`)
-	_, err := t.client.GetState()
-	return len(fns) > 0 || isErrProcessExited(err) || t.client.FollowExecEnabled()
 }

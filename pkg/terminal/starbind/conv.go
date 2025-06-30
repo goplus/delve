@@ -57,6 +57,11 @@ func (env *Env) interfaceToStarlarkValue(v interface{}) starlark.Value {
 		return starlark.None
 	case error:
 		return starlark.String(v.Error())
+	case reflect.Value:
+		if v.Type().Kind() == reflect.Struct {
+			return structAsStarlarkValue{v, env}
+		}
+		return env.interfaceToStarlarkValue(v.Interface())
 	default:
 		vval := reflect.ValueOf(v)
 		switch vval.Type().Kind() {
@@ -93,10 +98,13 @@ func (v sliceAsStarlarkValue) Freeze() {
 }
 
 func (v sliceAsStarlarkValue) Hash() (uint32, error) {
-	return 0, fmt.Errorf("not hashable")
+	return 0, errors.New("not hashable")
 }
 
 func (v sliceAsStarlarkValue) String() string {
+	if x, ok := v.v.Interface().([]byte); ok {
+		return string(x)
+	}
 	return fmt.Sprintf("%#v", v.v)
 }
 
@@ -155,7 +163,7 @@ func (v structAsStarlarkValue) Freeze() {
 }
 
 func (v structAsStarlarkValue) Hash() (uint32, error) {
-	return 0, fmt.Errorf("not hashable")
+	return 0, errors.New("not hashable")
 }
 
 func (v structAsStarlarkValue) String() string {
@@ -182,9 +190,48 @@ func (v structAsStarlarkValue) Attr(name string) (starlark.Value, error) {
 	}
 	r := v.v.FieldByName(name)
 	if !r.IsValid() {
-		return starlark.None, fmt.Errorf("no field named %q in %T", name, v.v.Interface())
+		return starlark.None, starlark.NoSuchAttrError(fmt.Sprintf("no field named %q in %T", name, v.v.Interface()))
 	}
-	return v.env.interfaceToStarlarkValue(r.Interface()), nil
+	return v.env.interfaceToStarlarkValue(r), nil
+}
+
+func (v structAsStarlarkValue) SetField(name string, value starlark.Value) (err error) {
+	defer func() {
+		// reflect.Value.SetInt, SetFloat, etc panic
+		ierr := recover()
+		if ierr == nil {
+			return
+		}
+		err, _ = ierr.(error)
+		if err == nil {
+			panic(ierr)
+		}
+		err = fmt.Errorf("can not assign to %T.%q: %v", v.v.Interface(), name, err)
+	}()
+	if r, err := v.valueAttr(name); err != nil || r != nil {
+		return starlark.NoSuchAttrError(fmt.Sprintf("no field named %s in %T", name, v.v.Interface()))
+	}
+	r := v.v.FieldByName(name)
+	if !r.IsValid() {
+		return starlark.NoSuchAttrError(fmt.Sprintf("no field named %q in %T", name, v.v.Interface()))
+	}
+	switch value := value.(type) {
+	case starlark.Int:
+		n, ok := value.Int64()
+		if !ok {
+			return fmt.Errorf("can not assign big integer to %T.%q", v.v.Interface(), name)
+		}
+		r.SetInt(n)
+	case starlark.Float:
+		r.SetFloat(float64(value))
+	case starlark.String:
+		r.SetString(value.GoString())
+	case starlark.Bool:
+		r.SetBool(bool(value))
+	default:
+		return fmt.Errorf("can not assign value of type %T to %T.%q", value, v.v.Interface(), name)
+	}
+	return nil
 }
 
 func (v structAsStarlarkValue) valueAttr(name string) (starlark.Value, error) {
@@ -228,10 +275,10 @@ func (env *Env) variableValueToStarlarkValue(v *api.Variable, top bool) (starlar
 	case reflect.String:
 		return starlark.String(v.Value), nil
 	case reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Int:
-		n, _ := strconv.ParseInt(v.Value, 0, 64)
+		n, _ := strconv.ParseInt(api.ExtractIntValue(v.Value), 0, 64)
 		return starlark.MakeInt64(n), nil
 	case reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uint, reflect.Uintptr:
-		n, _ := strconv.ParseUint(v.Value, 0, 64)
+		n, _ := strconv.ParseUint(api.ExtractIntValue(v.Value), 0, 64)
 		return starlark.MakeUint64(n), nil
 	case reflect.Bool:
 		n, _ := strconv.ParseBool(v.Value)
@@ -290,7 +337,7 @@ func (v structVariableAsStarlarkValue) Freeze() {
 }
 
 func (v structVariableAsStarlarkValue) Hash() (uint32, error) {
-	return 0, fmt.Errorf("not hashable")
+	return 0, errors.New("not hashable")
 }
 
 func (v structVariableAsStarlarkValue) String() string {
@@ -350,7 +397,7 @@ func (v sliceVariableAsStarlarkValue) Freeze() {
 }
 
 func (v sliceVariableAsStarlarkValue) Hash() (uint32, error) {
-	return 0, fmt.Errorf("not hashable")
+	return 0, errors.New("not hashable")
 }
 
 func (v sliceVariableAsStarlarkValue) String() string {
@@ -416,7 +463,7 @@ func (v ptrVariableAsStarlarkValue) Freeze() {
 }
 
 func (v ptrVariableAsStarlarkValue) Hash() (uint32, error) {
-	return 0, fmt.Errorf("not hashable")
+	return 0, errors.New("not hashable")
 }
 
 func (v ptrVariableAsStarlarkValue) String() string {
@@ -500,7 +547,7 @@ func (v mapVariableAsStarlarkValue) Freeze() {
 }
 
 func (v mapVariableAsStarlarkValue) Hash() (uint32, error) {
-	return 0, fmt.Errorf("not hashable")
+	return 0, errors.New("not hashable")
 }
 
 func (v mapVariableAsStarlarkValue) String() string {

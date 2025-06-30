@@ -27,6 +27,7 @@ const (
 	AttrGoRuntimeType   dwarf.Attr = 0x2904
 	AttrGoPackageName   dwarf.Attr = 0x2905
 	AttrGoDictIndex     dwarf.Attr = 0x2906
+	AttrGoClosureOffset dwarf.Attr = 0x2907
 )
 
 // Basic type encodings -- the value for AttrEncoding in a TagBaseType Entry.
@@ -1098,5 +1099,19 @@ func zeroArray(t Type) {
 		}
 		at.Count = 0
 		t = at.Type
+	}
+}
+
+// ResolveTypedef returns the underlying type of a typedef or qualified type.
+func ResolveTypedef(typ Type) Type {
+	for {
+		switch tt := typ.(type) {
+		case *TypedefType:
+			typ = tt.Type
+		case *QualType:
+			typ = tt.Type
+		default:
+			return typ
+		}
 	}
 }

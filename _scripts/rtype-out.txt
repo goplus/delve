@@ -27,7 +27,7 @@ type g struct {
 	waitsince int64
 	waitreason waitReason (optional)
 	stack stack
-	atomicstatus uint32|runtime/internal/atomic.Uint32
+	atomicstatus uint32|runtime/internal/atomic.Uint32|internal/runtime/atomic.Uint32
 }
 
 type gobuf struct {
@@ -45,21 +45,13 @@ type hmap struct {
 }
 
 type iface struct {
-	tab *itab
+	tab *itab|*internal/abi.ITab
 	data unsafe.Pointer
-}
-
-type itab struct {
-	_type *_type|*internal/abi.Type
 }
 
 type moduledata struct {
 	text uintptr
 	types uintptr
-}
-
-type runtime/internal/atomic.Uint32 struct {
-	value uint32
 }
 
 type stack struct {
@@ -71,12 +63,12 @@ const emptyOne = 1
 
 const emptyRest = 0
 
-const kindDirectIface = 32
+const internal/runtime/maps.ctrlEmpty = 128
 
-const kindGCProg = 64
-
-const kindMask = 31
+const kindDirectIface|internal/abi.KindDirectIface = 32
 
 const minTopHash = 4
 or const minTopHash = 5
+
+const tflagDirectIface|internal/abi.TFlagDirectIface = 32
 
